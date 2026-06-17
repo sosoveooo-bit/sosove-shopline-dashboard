@@ -56,7 +56,6 @@ ghcr.io/sosoveooo-bit/sosove-shopline-dashboard:latest
 After GitHub Actions finishes, deploy on a VPS:
 
 ```bash
-docker login ghcr.io -u sosoveooo-bit
 mkdir -p /opt/sosove-dashboard
 cd /opt/sosove-dashboard
 curl -O https://raw.githubusercontent.com/sosoveooo-bit/sosove-shopline-dashboard/main/docker-compose.yml
@@ -65,7 +64,14 @@ docker compose pull
 docker compose up -d
 ```
 
-If the package stays private, use a GitHub personal access token with `read:packages` as the password when logging in to GHCR.
+The commands above work without `docker login` after the GHCR package is public.
+Open the package page, go to **Package settings -> Danger Zone -> Change visibility**, and set it to **Public**:
+
+```text
+https://github.com/users/sosoveooo-bit/packages/container/package/sosove-shopline-dashboard
+```
+
+If the package stays private, use `docker login ghcr.io -u sosoveooo-bit` and enter a GitHub personal access token with `read:packages` as the password.
 
 Example `.env`:
 
