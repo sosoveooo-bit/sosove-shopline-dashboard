@@ -35,3 +35,12 @@ $env:SHOPLINE_AD_SPEND_JSON = '{"Facebook":12000,"Instagram":8000,"Google":5000,
 - `shopline_monitor/` - backend, static UI, and tests
 - `docs/plans/` - design note for the dashboard
 - `shopline-monitor-*.png` - UI previews
+
+## Deploy to Vercel
+
+1. Push this repository to GitHub.
+2. In Vercel, choose **New Project** and import this GitHub repo.
+3. Add the Shopline environment variables in **Project Settings -> Environment Variables**.
+4. Deploy.
+
+Vercel will detect `app.py` as the FastAPI entrypoint and deploy it as a Python Function. Every push to the connected branch triggers a new deployment.
