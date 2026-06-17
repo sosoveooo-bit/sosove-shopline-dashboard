@@ -1,0 +1,411 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>sosove品牌爆单数据面板</title>
+    <script>
+      (function () {
+        try {
+          var savedTheme = localStorage.getItem("shopline-monitor-theme");
+          document.documentElement.dataset.theme = savedTheme === "light" ? "light" : "dark";
+        } catch (error) {
+          document.documentElement.dataset.theme = "dark";
+        }
+      })();
+    </script>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="side-panel" aria-label="主导航">
+        <div class="brand">
+          <span class="brand-mark brand-logo" role="img" aria-label="SOSOVE logo"></span>
+          <div>
+            <strong>SOSOVE</strong>
+            <span>Shopline Command Center</span>
+          </div>
+        </div>
+        <nav class="nav-links">
+          <a class="active" href="#overview">总览</a>
+          <a href="#orders">订单</a>
+          <a href="#products">商品</a>
+          <a href="#connector">接口</a>
+        </nav>
+        <div class="side-status">
+          <span class="status-dot" id="side-status-dot"></span>
+          <div>
+            <span>运行模式</span>
+            <strong id="connector-mode">加载中</strong>
+          </div>
+        </div>
+      </aside>
+
+      <main class="content">
+        <header class="topbar" id="overview">
+          <div class="topbar-scan" aria-hidden="true"></div>
+          <div class="page-title">
+            <p>Independent Store / Prism Ops</p>
+            <h1>sosove品牌爆单数据面板</h1>
+            <span id="range-caption">--</span>
+            <div class="command-strip" aria-hidden="true">
+              <b>OPS-LIVE</b>
+              <b>JPY FLOW</b>
+              <b>ORDER RADAR</b>
+            </div>
+          </div>
+          <div class="toolbar" aria-label="看板操作">
+            <div class="segmented" role="group" aria-label="时间范围">
+              <button type="button" data-range="7d" class="active">7 天</button>
+              <button type="button" data-range="30d">30 天</button>
+              <button type="button" data-range="90d">90 天</button>
+            </div>
+            <div class="date-filter" aria-label="单日查询">
+              <button type="button" class="date-today" id="today-btn">今天</button>
+              <button type="button" class="date-choice" id="date-choice">选择日期</button>
+              <input type="date" id="date-picker" class="native-date" aria-label="选择查询日期">
+            </div>
+            <label class="theme-toggle" for="theme-toggle" title="切换黑白主题">
+              <input type="checkbox" id="theme-toggle" aria-label="切换黑白主题">
+              <span class="theme-toggle-ui" aria-hidden="true">
+                <span class="theme-toggle-track">
+                  <span class="theme-toggle-thumb"></span>
+                </span>
+                <span class="theme-toggle-text">黑白</span>
+              </span>
+            </label>
+            <label class="auto-refresh" for="auto-refresh-select">
+              <span>自动刷新</span>
+              <select id="auto-refresh-select" aria-label="自动刷新频率">
+                <option value="0">关闭</option>
+                <option value="300000">5 分钟</option>
+                <option value="600000">10 分钟</option>
+                <option value="1800000">30 分钟</option>
+              </select>
+            </label>
+            <button type="button" class="button ghost" id="test-connector-btn">接口测试</button>
+            <button type="button" class="button primary" id="sync-btn"><span aria-hidden="true">⟳</span>同步</button>
+          </div>
+        </header>
+
+        <section class="status-rail" aria-label="数据状态">
+          <article class="status-chip">
+            <span>Signal</span>
+            <strong id="rail-mode">--</strong>
+          </article>
+          <article class="status-chip">
+            <span>Window</span>
+            <strong id="rail-range">--</strong>
+          </article>
+          <article class="status-chip">
+            <span>Currency</span>
+            <strong id="rail-currency">--</strong>
+          </article>
+          <article class="status-chip">
+            <span>Last Sync</span>
+            <strong id="rail-sync">--</strong>
+          </article>
+        </section>
+
+        <section class="notice critical" id="error-panel" hidden></section>
+
+        <section class="kpi-grid" aria-label="核心指标">
+          <article class="metric-card revenue" data-kpi="revenue">
+            <span>Revenue</span>
+            <h2>销售额</h2>
+            <strong data-value>--</strong>
+            <small data-delta>--</small>
+            <div class="metric-track"><i></i></div>
+          </article>
+          <article class="metric-card orders" data-kpi="orders">
+            <span>Orders</span>
+            <h2>订单数</h2>
+            <strong data-value>--</strong>
+            <small data-delta>--</small>
+            <div class="metric-track"><i></i></div>
+          </article>
+          <article class="metric-card conversion" data-kpi="conversion">
+            <span>Conversion</span>
+            <h2>转化率</h2>
+            <strong data-value>--</strong>
+            <small data-delta>--</small>
+            <div class="metric-track"><i></i></div>
+          </article>
+          <article class="metric-card aov" data-kpi="aov">
+            <span>AOV</span>
+            <h2>客单价</h2>
+            <strong data-value>--</strong>
+            <small data-delta>--</small>
+            <div class="metric-track"><i></i></div>
+          </article>
+          <article class="metric-card units" data-kpi="units">
+            <span>Units</span>
+            <h2>售出件数</h2>
+            <strong data-value>--</strong>
+            <small data-delta>--</small>
+            <div class="metric-track"><i></i></div>
+          </article>
+          <article class="metric-card stock" data-kpi="lowStock">
+            <span>Stock</span>
+            <h2>低库存 SKU</h2>
+            <strong data-value>--</strong>
+            <small data-delta>--</small>
+            <div class="metric-track"><i></i></div>
+          </article>
+        </section>
+
+        <section class="layout-grid">
+          <article class="panel wide">
+            <div class="panel-header">
+              <div>
+                <p>Trend</p>
+                <h2>销售额与订单趋势</h2>
+              </div>
+              <span class="panel-badge" id="source-badge">--</span>
+            </div>
+            <div class="chart-canvas" id="revenue-chart" role="img" aria-label="销售额与订单趋势图"></div>
+          </article>
+
+          <article class="panel" id="connector">
+            <div class="panel-header">
+              <div>
+                <p>Connector</p>
+                <h2>Shopline 接口</h2>
+              </div>
+              <span class="status-pill" id="connector-pill">--</span>
+            </div>
+            <dl class="connector-list">
+              <div>
+                <dt>API Base</dt>
+                <dd id="connector-base">--</dd>
+              </div>
+              <div>
+                <dt>订单端点</dt>
+                <dd id="connector-orders">--</dd>
+              </div>
+              <div>
+                <dt>商品端点</dt>
+                <dd id="connector-products">--</dd>
+              </div>
+              <div>
+                <dt>缺少配置</dt>
+                <dd id="connector-missing">--</dd>
+              </div>
+            </dl>
+          </article>
+        </section>
+
+        <section class="layout-grid">
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <p>Channels</p>
+                <h2>流量来源</h2>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>来源</th>
+                    <th>订单</th>
+                    <th>销售额</th>
+                    <th>占比</th>
+                  </tr>
+                </thead>
+                <tbody id="channel-rows"></tbody>
+              </table>
+            </div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <p>Signals</p>
+                <h2>预警信号</h2>
+              </div>
+            </div>
+            <div class="signal-list" id="alert-list"></div>
+          </article>
+        </section>
+
+        <section class="layout-grid ops-grid">
+          <article class="panel finance-panel">
+            <div class="panel-header">
+              <div>
+                <p>Profit</p>
+                <h2>利润估算</h2>
+              </div>
+              <span class="panel-badge" id="profit-margin">--</span>
+            </div>
+            <div class="finance-grid">
+              <div>
+                <span>预计利润</span>
+                <strong id="profit-main">--</strong>
+              </div>
+              <div>
+                <span>广告花费</span>
+                <strong id="profit-adcost">--</strong>
+              </div>
+              <div>
+                <span>平台成本</span>
+                <strong id="profit-platform">--</strong>
+              </div>
+              <div>
+                <span>商品成本</span>
+                <strong id="profit-product-cost">--</strong>
+              </div>
+            </div>
+            <dl class="cost-list">
+              <div><dt>商品成本率</dt><dd id="profit-cost-rate">--</dd></div>
+              <div><dt>支付手续费率</dt><dd id="profit-fee-rate">--</dd></div>
+              <div><dt>单均物流成本</dt><dd id="profit-shipping">--</dd></div>
+            </dl>
+            <p class="panel-note" id="profit-note">--</p>
+          </article>
+
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <p>Ads</p>
+                <h2>渠道 ROAS</h2>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>渠道</th>
+                    <th>销售额</th>
+                    <th>花费</th>
+                    <th>ROAS</th>
+                    <th>CPA</th>
+                  </tr>
+                </thead>
+                <tbody id="ad-rows"></tbody>
+              </table>
+            </div>
+          </article>
+        </section>
+
+        <section class="layout-grid insight-grid">
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <p>Customers</p>
+                <h2>客户分析</h2>
+              </div>
+            </div>
+            <div class="mini-grid">
+              <div><span>唯一客户</span><strong id="customer-unique">--</strong></div>
+              <div><span>新客</span><strong id="customer-new">--</strong></div>
+              <div><span>复购客户</span><strong id="customer-repeat">--</strong></div>
+              <div><span>复购订单率</span><strong id="customer-repeat-rate">--</strong></div>
+            </div>
+            <ol class="rank-list" id="customer-list"></ol>
+          </article>
+
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <p>Status</p>
+                <h2>订单状态</h2>
+              </div>
+            </div>
+            <div class="status-breakdown" id="status-list"></div>
+          </article>
+        </section>
+
+        <section class="panel" id="products">
+          <div class="panel-header">
+            <div>
+              <p>Products</p>
+              <h2>热卖商品与库存</h2>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>商品</th>
+                  <th>SKU</th>
+                  <th>售出</th>
+                  <th>销售额</th>
+                  <th>库存</th>
+                  <th>状态</th>
+                </tr>
+              </thead>
+              <tbody id="product-rows"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="layout-grid bottom-grid">
+          <article class="panel" id="orders">
+            <div class="panel-header">
+              <div>
+                <p>Orders</p>
+                <h2>最近订单</h2>
+              </div>
+              <span id="last-sync">--</span>
+            </div>
+            <div class="order-tools">
+              <input type="search" id="order-search" placeholder="搜索订单号 / 客户 / 来源" aria-label="搜索订单">
+              <select id="order-source-filter" aria-label="按来源筛选">
+                <option value="">全部来源</option>
+              </select>
+              <select id="order-status-filter" aria-label="按状态筛选">
+                <option value="">全部状态</option>
+                <option value="paid">已支付</option>
+                <option value="unpaid">未支付</option>
+                <option value="fulfilled">已发货</option>
+                <option value="unfulfilled">待发货</option>
+                <option value="refunded">退款</option>
+                <option value="cancelled">取消</option>
+              </select>
+              <button type="button" class="button ghost" id="order-export-btn">导出 CSV</button>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>订单</th>
+                    <th>客户</th>
+                    <th>来源</th>
+                    <th>金额</th>
+                    <th>状态</th>
+                  </tr>
+                </thead>
+                <tbody id="order-rows"></tbody>
+              </table>
+            </div>
+            <div class="order-footer">
+              <div class="order-summary">
+                <span id="order-scope">--</span>
+                <strong id="order-summary">--</strong>
+              </div>
+              <div class="order-pagination" aria-label="订单分页">
+                <button class="page-nav" id="order-prev-btn" type="button" aria-label="上一页" title="上一页">‹</button>
+                <span class="page-status" id="order-page-status">--</span>
+                <button class="page-nav" id="order-next-btn" type="button" aria-label="下一页" title="下一页">›</button>
+              </div>
+            </div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <p>Activity</p>
+                <h2>同步动态</h2>
+              </div>
+            </div>
+            <ol class="event-list" id="event-list"></ol>
+          </article>
+        </section>
+      </main>
+    </div>
+
+    <div class="toast" id="toast" hidden></div>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>
