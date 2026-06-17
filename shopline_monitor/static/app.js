@@ -215,6 +215,7 @@ function renderConnector(payload) {
   document.getElementById("connector-base").textContent = connector.baseUrl || "未配置";
   document.getElementById("connector-orders").textContent = connector.ordersEndpoint || "未配置";
   document.getElementById("connector-products").textContent = connector.productsEndpoint || "未配置";
+  document.getElementById("connector-timezone").textContent = connector.timezoneName || "Asia/Tokyo";
   const missingNode = document.getElementById("connector-missing");
   missingNode.textContent = connector.missing.length ? `${connector.missing.length} 项未配置` : "无";
   missingNode.title = connector.missing.join(", ");
@@ -233,10 +234,13 @@ function renderKpis(kpis, currency) {
     if (!card) return;
     card.querySelector("[data-value]").textContent = formatMetric(kpi.value, kpi.type, currency);
     const deltaNode = card.querySelector("[data-delta]");
-    deltaNode.textContent = `${kpi.delta >= 0 ? "+" : ""}${kpi.delta}% vs 上期`;
-    deltaNode.classList.toggle("negative", kpi.delta < 0);
+    const hasDelta = kpi.delta !== null && kpi.delta !== undefined && Number.isFinite(Number(kpi.delta));
+    deltaNode.textContent = hasDelta
+      ? `${kpi.delta >= 0 ? "+" : ""}${kpi.delta}% vs 上期`
+      : (kpi.note || "无对比数据");
+    deltaNode.classList.toggle("negative", hasDelta && kpi.delta < 0);
     const fill = card.querySelector(".metric-track i");
-    fill.style.width = `${Math.max(18, Math.min(100, Math.abs(kpi.delta) + 48))}%`;
+    fill.style.width = hasDelta ? `${Math.max(18, Math.min(100, Math.abs(kpi.delta) + 48))}%` : "18%";
   });
 }
 
@@ -626,6 +630,7 @@ function renderTable(id, rows, emptyText, colspan) {
 }
 
 function formatMetric(value, type, currency) {
+  if (value === null || value === undefined || value === "") return "--";
   if (type === "currency") return formatCompactCurrency(value, currency);
   if (type === "percent") return formatPercent(value);
   return formatNumber(value);
@@ -677,10 +682,12 @@ function trimNumber(value) {
 }
 
 function formatNumber(value) {
+  if (value === null || value === undefined || value === "") return "--";
   return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(Number(value) || 0);
 }
 
 function formatPercent(value) {
+  if (value === null || value === undefined || value === "") return "--";
   return `${new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(Number(value) || 0)}%`;
 }
 

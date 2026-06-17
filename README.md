@@ -12,23 +12,43 @@ Then open `http://127.0.0.1:8787/`.
 
 ## Shopline env vars
 
-```powershell
-$env:SHOPLINE_API_BASE_URL = "https://jp-sosove.myshopline.com"
-$env:SHOPLINE_ACCESS_TOKEN = "your-access-token"
-$env:SHOPLINE_ORDERS_ENDPOINT = "/orders"
-$env:SHOPLINE_PRODUCTS_ENDPOINT = "/products"
-$env:SHOPLINE_DEFAULT_CURRENCY = "JPY"
-$env:SHOPLINE_MAX_ORDER_PAGES = "5"
+The app automatically loads `.env` from the project root. Copy `.env.example` to `.env`, then fill in your real Shopline token.
+
+```bash
+SHOPLINE_API_BASE_URL=https://jp-sosove.myshopline.com
+SHOPLINE_ACCESS_TOKEN=your-shopline-api-token
+SHOPLINE_ORDERS_ENDPOINT=/orders
+SHOPLINE_PRODUCTS_ENDPOINT=/products
+
+SHOPLINE_API_VERSION=v20260301
+SHOPLINE_STORE_DOMAIN=jp-sosove.myshopline.com
+SHOPLINE_TOKEN_HEADER=Authorization
+SHOPLINE_AUTH_PREFIX=Bearer
+SHOPLINE_DEFAULT_CURRENCY=JPY
+SHOPLINE_TIMEZONE=Asia/Tokyo
+SHOPLINE_MAX_ORDER_PAGES=10
+SHOPLINE_TIMEOUT_SECONDS=12
+
+SHOPLINE_CONVERSION_TRAFFIC_FIELD=visitors
+SHOPLINE_TRAFFIC_JSON={}
+
+SHOPLINE_PRODUCT_COST_RATE=0.35
+SHOPLINE_PAYMENT_FEE_RATE=0.036
+SHOPLINE_SHIPPING_COST_PER_ORDER=500
+
+SHOPLINE_AD_SPEND_JSON={"Facebook":0,"Instagram":0,"Google":0,"TikTok":0,"Email":0,"Direct":0,"Organic":0,"Ad":0}
 ```
 
-Optional cost settings:
+`SHOPLINE_TIMEZONE` controls the "today" boundary for order queries. Increase `SHOPLINE_MAX_ORDER_PAGES` if a selected period has more than 1,000 orders.
 
-```powershell
-$env:SHOPLINE_PRODUCT_COST_RATE = "0.35"
-$env:SHOPLINE_PAYMENT_FEE_RATE = "0.036"
-$env:SHOPLINE_SHIPPING_COST_PER_ORDER = "500"
-$env:SHOPLINE_AD_SPEND_JSON = '{"Facebook":12000,"Instagram":8000,"Google":5000,"TikTok":3000}'
+Conversion rate is calculated as `orders / visitors * 100` by default. Shopline order/product APIs do not include store visitor counts, so live dashboards show `--` until traffic data is configured. Add daily traffic from Shopline analytics, GA4, or another traffic source:
+
+```bash
+SHOPLINE_TRAFFIC_JSON={"2026-06-17":{"visitors":1200,"sessions":1350}}
+SHOPLINE_CONVERSION_TRAFFIC_FIELD=visitors
 ```
+
+Set `SHOPLINE_CONVERSION_TRAFFIC_FIELD=sessions` if you want to match a sessions-based analytics report.
 
 ## Files
 
@@ -77,15 +97,20 @@ Example `.env`:
 
 ```bash
 SHOPLINE_API_BASE_URL=https://jp-sosove.myshopline.com
-SHOPLINE_ACCESS_TOKEN=your-access-token
+SHOPLINE_ACCESS_TOKEN=your-shopline-api-token
 SHOPLINE_ORDERS_ENDPOINT=/orders
 SHOPLINE_PRODUCTS_ENDPOINT=/products
+SHOPLINE_API_VERSION=v20260301
+SHOPLINE_STORE_DOMAIN=jp-sosove.myshopline.com
 SHOPLINE_DEFAULT_CURRENCY=JPY
-SHOPLINE_MAX_ORDER_PAGES=5
+SHOPLINE_TIMEZONE=Asia/Tokyo
+SHOPLINE_MAX_ORDER_PAGES=10
+SHOPLINE_CONVERSION_TRAFFIC_FIELD=visitors
+SHOPLINE_TRAFFIC_JSON={}
 SHOPLINE_PRODUCT_COST_RATE=0.35
 SHOPLINE_PAYMENT_FEE_RATE=0.036
 SHOPLINE_SHIPPING_COST_PER_ORDER=500
-SHOPLINE_AD_SPEND_JSON={"Facebook":12000,"Instagram":8000,"Google":5000,"TikTok":3000}
+SHOPLINE_AD_SPEND_JSON={"Facebook":0,"Instagram":0,"Google":0,"TikTok":0,"Email":0,"Direct":0,"Organic":0,"Ad":0}
 ```
 
 The container listens on port `8000`, so open `http://your-server-ip:8000/` or put Nginx in front of it.

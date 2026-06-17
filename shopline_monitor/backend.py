@@ -12,16 +12,19 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
+from zoneinfo import ZoneInfo
 
 
 SUPPORTED_RANGES = {"1d": 1, "7d": 7, "30d": 30, "90d": 90}
 DEFAULT_CURRENCY = "USD"
 DEFAULT_API_VERSION = "v20260301"
+DEFAULT_TIMEZONE = "Asia/Tokyo"
 ORDER_PAGE_LIMIT = 100
 DEFAULT_MAX_ORDER_PAGES = 5
 DEFAULT_PRODUCT_COST_RATE = 0.35
 DEFAULT_PAYMENT_FEE_RATE = 0.036
 DEFAULT_SHIPPING_COST_PER_ORDER = 0.0
+DEFAULT_CONVERSION_TRAFFIC_FIELD = "visitors"
 TRAFFIC_SOURCE_BUCKETS = {
     "Facebook",
     "Instagram",
@@ -45,6 +48,8 @@ class ShoplineConfig:
     auth_prefix: str = "Bearer"
     timeout_seconds: float = 12.0
     default_currency: str = DEFAULT_CURRENCY
+    timezone_name: str = DEFAULT_TIMEZONE
+    conversion_traffic_field: str = DEFAULT_CONVERSION_TRAFFIC_FIELD
     max_order_pages: int = DEFAULT_MAX_ORDER_PAGES
 
     @classmethod
@@ -79,6 +84,12 @@ class ShoplineConfig:
                 os.getenv("SHOPLINE_DEFAULT_CURRENCY", DEFAULT_CURRENCY).strip()
                 or DEFAULT_CURRENCY
             ).upper(),
+            timezone_name=(
+                os.getenv("SHOPLINE_TIMEZONE", DEFAULT_TIMEZONE).strip() or DEFAULT_TIMEZONE
+            ),
+            conversion_traffic_field=normalize_traffic_field(
+                os.getenv("SHOPLINE_CONVERSION_TRAFFIC_FIELD", DEFAULT_CONVERSION_TRAFFIC_FIELD)
+            ),
             max_order_pages=max_order_pages,
         )
 
@@ -135,12 +146,15 @@ class ShoplineClient:
             "tokenHeader": self.config.token_header,
             "tokenPreview": mask_secret(self.config.access_token),
             "defaultCurrency": self.config.default_currency,
+            "timezoneName": self.config.timezone_name,
+            "trafficConfigured": bool(load_traffic_from_env()),
+            "conversionTrafficField": self.config.conversion_traffic_field,
             "maxOrderPages": self.config.max_order_pages,
             "missing": missing,
         }
 
     def load_orders(self, days: int, today: date | None = None) -> dict[str, Any]:
-        today = today or date.today()
+        today = today or current_dashboard_date(self.config.timezone_name)
         if not self.config.has_credentials or not self.config.orders_path:
             return {
                 "items": sample_orders(days, today=today, currency=self.config.default_currency),
@@ -149,7 +163,7 @@ class ShoplineClient:
             }
 
         start = today - timedelta(days=max(days - 1, 0))
-        params = build_order_query_params(start, today)
+        params = build_order_query_params(start, today, timezone_name=self.config.timezone_name)
         try:
             orders = []
             seen_page_info = set()
@@ -172,7 +186,7 @@ class ShoplineClient:
             }
 
     def load_products(self, today: date | None = None) -> dict[str, Any]:
-        today = today or date.today()
+        today = today or current_dashboard_date(self.config.timezone_name)
         if not self.config.has_credentials or not self.config.products_path:
             return {
                 "items": sample_products(today=today, currency=self.config.default_currency),
@@ -224,7 +238,7 @@ class ShoplineClient:
                 "ok": True,
                 "mode": "sample",
                 "message": "sample mode",
-                "checkedAt": now_iso(),
+                "checkedAt": now_iso(timezone_name=self.config.timezone_name),
             }
 
         probe_path = self.config.orders_path or self.config.products_path
@@ -235,14 +249,14 @@ class ShoplineClient:
                 "ok": True,
                 "mode": "live",
                 "message": f"received {count} item(s)",
-                "checkedAt": now_iso(),
+                "checkedAt": now_iso(timezone_name=self.config.timezone_name),
             }
         except Exception as exc:  # pragma: no cover - network-specific branch
             return {
                 "ok": False,
                 "mode": "live",
                 "message": f"{exc.__class__.__name__}: {exc}",
-                "checkedAt": now_iso(),
+                "checkedAt": now_iso(timezone_name=self.config.timezone_name),
             }
 
 
@@ -251,9 +265,9 @@ def build_dashboard_payload(
     client: ShoplineClient | None = None,
     today: date | None = None,
 ) -> dict[str, Any]:
-    today = today or date.today()
-    days = resolve_range_days(range_key)
     client = client or ShoplineClient()
+    today = today or current_dashboard_date(client.config.timezone_name)
+    days = resolve_range_days(range_key)
 
     current_start = today - timedelta(days=days - 1)
     previous_start = current_start - timedelta(days=days)
@@ -270,11 +284,34 @@ def build_dashboard_payload(
     previous_orders = filter_orders_by_window(
         list(previous_orders_result["items"]), previous_start, previous_end
     )
-    current_traffic = build_traffic_series(current_start, today, current_orders)
-    previous_traffic = build_traffic_series(previous_start, previous_end, previous_orders)
+    traffic_overrides = load_traffic_from_env()
+    current_traffic = build_traffic_series(
+        current_start,
+        today,
+        current_orders,
+        traffic_overrides=traffic_overrides,
+        sample_mode=current_orders_result.get("source") == "sample",
+    )
+    previous_traffic = build_traffic_series(
+        previous_start,
+        previous_end,
+        previous_orders,
+        traffic_overrides=traffic_overrides,
+        sample_mode=previous_orders_result.get("source") == "sample",
+    )
 
-    current_kpis = calculate_kpis(current_orders, products, current_traffic)
-    previous_kpis = calculate_kpis(previous_orders, products, previous_traffic)
+    current_kpis = calculate_kpis(
+        current_orders,
+        products,
+        current_traffic,
+        conversion_traffic_field=client.config.conversion_traffic_field,
+    )
+    previous_kpis = calculate_kpis(
+        previous_orders,
+        products,
+        previous_traffic,
+        conversion_traffic_field=client.config.conversion_traffic_field,
+    )
     series = build_series(current_start, today, current_orders, current_traffic)
     channels = build_channels(current_orders)
     cost_config = CostConfig.from_env()
@@ -306,7 +343,7 @@ def build_dashboard_payload(
         "source": {
             "mode": source_mode,
             "label": source_label(source_mode),
-            "syncedAt": now_iso(),
+            "syncedAt": now_iso(timezone_name=client.config.timezone_name),
             "errors": errors,
         },
         "currency": currency,
@@ -316,7 +353,11 @@ def build_dashboard_payload(
             ),
             "orders": kpi_item("订单数", current_kpis["orders"], previous_kpis["orders"], "number"),
             "conversion": kpi_item(
-                "转化率", current_kpis["conversion"], previous_kpis["conversion"], "percent"
+                "转化率",
+                current_kpis["conversion"],
+                previous_kpis["conversion"],
+                "percent",
+                note=conversion_note(current_kpis["conversion"]),
             ),
             "aov": kpi_item("客单价", current_kpis["aov"], previous_kpis["aov"], "currency"),
             "units": kpi_item("售出件数", current_kpis["units"], previous_kpis["units"], "number"),
@@ -331,7 +372,7 @@ def build_dashboard_payload(
         "products": build_product_rows(current_orders, products),
         "orders": build_recent_orders(filter_orders_by_window(current_orders, today, today)),
         "alerts": build_alerts(current_kpis, current_orders, products, source_mode, errors),
-        "events": build_events(source_mode, current_kpis, errors),
+        "events": build_events(source_mode, current_kpis, errors, client.config.timezone_name),
         "connector": client.connector_status(),
     }
 
@@ -361,6 +402,7 @@ def build_order_query_params(
     start: date,
     end: date,
     limit: int = ORDER_PAGE_LIMIT,
+    timezone_name: str | None = None,
 ) -> dict[str, str]:
     safe_limit = max(1, min(limit, ORDER_PAGE_LIMIT))
     return {
@@ -368,8 +410,8 @@ def build_order_query_params(
         "status": "any",
         "hidden_order": "false",
         "sort_condition": "order_at:desc",
-        "created_at_min": local_midnight(start).isoformat(timespec="seconds"),
-        "created_at_max": local_end_of_day(end).isoformat(timespec="seconds"),
+        "created_at_min": local_midnight(start, timezone_name).isoformat(timespec="seconds"),
+        "created_at_max": local_end_of_day(end, timezone_name).isoformat(timespec="seconds"),
     }
 
 
@@ -389,19 +431,28 @@ def next_page_info_from_link(link_header: str) -> str:
     return ""
 
 
-def kpi_item(label: str, value: float, previous: float, value_type: str) -> dict[str, Any]:
+def kpi_item(
+    label: str,
+    value: float | None,
+    previous: float | None,
+    value_type: str,
+    note: str = "",
+) -> dict[str, Any]:
     delta = calculate_delta(value, previous)
     return {
         "label": label,
-        "value": round_number(value),
-        "previous": round_number(previous),
-        "delta": round(delta, 1),
+        "value": round_number(value) if value is not None else None,
+        "previous": round_number(previous) if previous is not None else None,
+        "delta": round(delta, 1) if delta is not None else None,
         "type": value_type,
-        "tone": "positive" if delta >= 0 else "negative",
+        "tone": "neutral" if delta is None else "positive" if delta >= 0 else "negative",
+        "note": note,
     }
 
 
-def calculate_delta(current: float, previous: float) -> float:
+def calculate_delta(current: float | None, previous: float | None) -> float | None:
+    if current is None or previous is None:
+        return None
     if previous == 0:
         return 100.0 if current > 0 else 0.0
     return ((current - previous) / abs(previous)) * 100
@@ -411,20 +462,41 @@ def calculate_kpis(
     orders: list[dict[str, Any]],
     products: list[dict[str, Any]],
     traffic: list[dict[str, Any]],
-) -> dict[str, float]:
+    conversion_traffic_field: str = DEFAULT_CONVERSION_TRAFFIC_FIELD,
+) -> dict[str, float | None]:
     revenue = sum(float(order.get("total", 0)) for order in orders)
     order_count = len(orders)
-    visitors = sum(int(day.get("visitors", 0)) for day in traffic)
+    conversion = calculate_conversion_rate(orders, traffic, conversion_traffic_field)
     units = sum(int(order.get("units", 0)) for order in orders)
     low_stock = sum(1 for product in products if int(product.get("inventory", 0)) <= 5)
     return {
         "revenue": revenue,
         "orders": float(order_count),
-        "conversion": (order_count / visitors * 100) if visitors else 0.0,
+        "conversion": conversion,
         "aov": (revenue / order_count) if order_count else 0.0,
         "units": float(units),
         "lowStock": float(low_stock),
     }
+
+
+def calculate_conversion_rate(
+    orders: list[dict[str, Any]],
+    traffic: list[dict[str, Any]],
+    traffic_field: str = DEFAULT_CONVERSION_TRAFFIC_FIELD,
+) -> float | None:
+    field = normalize_traffic_field(traffic_field)
+    rows = [row for row in traffic if isinstance(row.get(field), (int, float))]
+    denominator = sum(float(row.get(field) or 0) for row in rows)
+    if denominator <= 0:
+        return None
+
+    traffic_dates = {str(row.get("date")) for row in rows}
+    matching_orders = [
+        order
+        for order in orders
+        if str(order.get("createdAt", ""))[:10] in traffic_dates
+    ]
+    return len(matching_orders) / denominator * 100
 
 
 def normalize_shopline_orders(
@@ -507,7 +579,7 @@ def normalize_order(
             "order_time",
             "paid_at",
         )
-    ) or date.today()
+    ) or current_dashboard_date()
 
     normalized_source, raw_source = extract_order_traffic_source(order)
 
@@ -651,7 +723,8 @@ def normalize_product(
         "inventory": parse_int(inventory),
         "status": str(pick(product, "status", "state", default="active")),
         "updatedAt": (
-            parse_date(pick(product, "updated_at", "updatedAt", "created_at")) or date.today()
+            parse_date(pick(product, "updated_at", "updatedAt", "created_at"))
+            or current_dashboard_date()
         ).isoformat(),
     }
 
@@ -842,6 +915,61 @@ def load_ad_spend_from_env() -> dict[str, float]:
     return spend
 
 
+def load_traffic_from_env() -> dict[str, dict[str, int]]:
+    traffic: dict[str, dict[str, int]] = {}
+    for env_name in (
+        "SHOPLINE_TRAFFIC_JSON",
+        "SHOPLINE_DAILY_VISITORS_JSON",
+        "SHOPLINE_VISITORS_JSON",
+    ):
+        raw_json = os.getenv(env_name, "").strip()
+        if raw_json:
+            merge_traffic_json(traffic, raw_json)
+
+    for env_name in ("SHOPLINE_DAILY_SESSIONS_JSON", "SHOPLINE_SESSIONS_JSON"):
+        raw_json = os.getenv(env_name, "").strip()
+        if raw_json:
+            merge_traffic_json(traffic, raw_json, default_field="sessions")
+
+    return traffic
+
+
+def merge_traffic_json(
+    target: dict[str, dict[str, int]],
+    raw_json: str,
+    default_field: str = "visitors",
+) -> None:
+    try:
+        parsed = json.loads(raw_json)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(parsed, dict):
+        return
+
+    for raw_date, raw_value in parsed.items():
+        day = parse_date(raw_date)
+        if not day:
+            continue
+        key = day.isoformat()
+        row = target.setdefault(key, {})
+        if isinstance(raw_value, dict):
+            if "visitors" in raw_value:
+                row["visitors"] = max(0, parse_int(raw_value.get("visitors")))
+            if "sessions" in raw_value:
+                row["sessions"] = max(0, parse_int(raw_value.get("sessions")))
+        else:
+            row[default_field] = max(0, parse_int(raw_value))
+
+
+def normalize_traffic_field(value: Any) -> str:
+    field = str(value or "").strip().lower()
+    return "sessions" if field == "sessions" else "visitors"
+
+
+def conversion_note(value: float | None) -> str:
+    return "" if value is not None else "未配置真实访客数"
+
+
 def first_dict(*values: Any) -> dict[str, Any]:
     for value in values:
         if isinstance(value, dict):
@@ -927,25 +1055,44 @@ def filter_orders_by_window(
 
 
 def build_traffic_series(
-    start: date, end: date, orders: list[dict[str, Any]]
+    start: date,
+    end: date,
+    orders: list[dict[str, Any]],
+    traffic_overrides: dict[str, dict[str, int]] | None = None,
+    sample_mode: bool = True,
 ) -> list[dict[str, Any]]:
     by_date: dict[str, int] = {}
     for order in orders:
         day = str(order.get("createdAt", ""))[:10]
         by_date[day] = by_date.get(day, 0) + 1
 
+    traffic_overrides = traffic_overrides or {}
     series = []
     cursor = start
     while cursor <= end:
+        key = cursor.isoformat()
         order_count = by_date.get(cursor.isoformat(), 0)
-        rng = random.Random(cursor.toordinal() * 17)
-        baseline = 380 + rng.randint(0, 220)
-        visitors = max(baseline, order_count * rng.randint(32, 58) + rng.randint(80, 180))
+        configured = traffic_overrides.get(key)
+        if configured is not None:
+            visitors = configured.get("visitors")
+            sessions = configured.get("sessions")
+            source = "configured"
+        elif sample_mode:
+            rng = random.Random(cursor.toordinal() * 17)
+            baseline = 380 + rng.randint(0, 220)
+            visitors = max(baseline, order_count * rng.randint(32, 58) + rng.randint(80, 180))
+            sessions = int(visitors * (1.12 + rng.random() * 0.22))
+            source = "sample"
+        else:
+            visitors = None
+            sessions = None
+            source = "missing"
         series.append(
             {
-                "date": cursor.isoformat(),
+                "date": key,
                 "visitors": visitors,
-                "sessions": int(visitors * (1.12 + rng.random() * 0.22)),
+                "sessions": sessions,
+                "source": source,
             }
         )
         cursor += timedelta(days=1)
@@ -970,7 +1117,13 @@ def build_series(
         key = cursor.isoformat()
         day_orders = order_map.get(key, [])
         revenue = sum(float(order.get("total", 0)) for order in day_orders)
-        visitors = int(traffic_map.get(key, {}).get("visitors", 0))
+        visitor_value = traffic_map.get(key, {}).get("visitors")
+        visitors = parse_int(visitor_value) if visitor_value is not None else None
+        conversion = (
+            round_number((len(day_orders) / visitors * 100))
+            if visitors and visitors > 0
+            else None
+        )
         rows.append(
             {
                 "date": key,
@@ -978,7 +1131,7 @@ def build_series(
                 "revenue": round_number(revenue),
                 "orders": len(day_orders),
                 "visitors": visitors,
-                "conversion": round_number((len(day_orders) / visitors * 100) if visitors else 0),
+                "conversion": conversion,
             }
         )
         cursor += timedelta(days=1)
@@ -1339,7 +1492,7 @@ def build_alerts(
                 "message": f"{len(pending_orders)} 个订单仍在待发货状态。",
             }
         )
-    if kpis["conversion"] < 1:
+    if kpis["conversion"] is not None and kpis["conversion"] < 1:
         alerts.append(
             {
                 "level": "warning",
@@ -1350,22 +1503,27 @@ def build_alerts(
     return alerts[:5]
 
 
-def build_events(source_mode: str, kpis: dict[str, float], errors: list[str]) -> list[dict[str, Any]]:
+def build_events(
+    source_mode: str,
+    kpis: dict[str, float],
+    errors: list[str],
+    timezone_name: str | None = None,
+) -> list[dict[str, Any]]:
     events = [
         {
-            "time": now_iso(),
+            "time": now_iso(timezone_name=timezone_name),
             "kind": "sync",
             "title": "数据同步完成",
             "detail": f"{int(kpis['orders'])} 个订单已进入当前看板。",
         },
         {
-            "time": now_iso(minutes=-18),
+            "time": now_iso(minutes=-18, timezone_name=timezone_name),
             "kind": "inventory",
             "title": "库存扫描",
             "detail": f"{int(kpis['lowStock'])} 个 SKU 需要补货关注。",
         },
         {
-            "time": now_iso(minutes=-45),
+            "time": now_iso(minutes=-45, timezone_name=timezone_name),
             "kind": "source",
             "title": "数据模式",
             "detail": source_label(source_mode),
@@ -1375,7 +1533,7 @@ def build_events(source_mode: str, kpis: dict[str, float], errors: list[str]) ->
         events.insert(
             0,
             {
-                "time": now_iso(minutes=-2),
+                "time": now_iso(minutes=-2, timezone_name=timezone_name),
                 "kind": "error",
                 "title": "接口错误",
                 "detail": errors[0],
@@ -1396,7 +1554,7 @@ def detect_currency(
 
 
 def sample_products(today: date | None = None, currency: str = DEFAULT_CURRENCY) -> list[dict[str, Any]]:
-    today = today or date.today()
+    today = today or current_dashboard_date()
     names = [
         ("Linen Market Dress", "LM-DRESS", "Dresses", 89, 14),
         ("Satin Work Blouse", "SW-BLOUSE", "Tops", 54, 7),
@@ -1430,7 +1588,7 @@ def sample_orders(
     today: date | None = None,
     currency: str = DEFAULT_CURRENCY,
 ) -> list[dict[str, Any]]:
-    today = today or date.today()
+    today = today or current_dashboard_date()
     products = sample_products(today=today, currency=currency)
     rng = random.Random(today.toordinal() + days * 113)
     sources = ["Meta", "fb", "ins", "Instagram", "Google", "TikTok", "Email", "Direct", "Organic", "ad"]
@@ -1552,14 +1710,30 @@ def round_number(value: float, digits: int = 2) -> float:
     return int(rounded) if rounded.is_integer() else rounded
 
 
-def now_iso(minutes: int = 0) -> str:
-    now = datetime.now(timezone.utc).astimezone() + timedelta(minutes=minutes)
+def current_dashboard_date(timezone_name: str | None = None) -> date:
+    return datetime.now(resolve_timezone(timezone_name)).date()
+
+
+def resolve_timezone(timezone_name: str | None = None):
+    name = timezone_name or os.getenv("SHOPLINE_TIMEZONE", DEFAULT_TIMEZONE)
+    name = str(name).strip() or DEFAULT_TIMEZONE
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return datetime.now().astimezone().tzinfo or timezone.utc
+
+
+def now_iso(minutes: int = 0, timezone_name: str | None = None) -> str:
+    tz = resolve_timezone(timezone_name)
+    now = datetime.now(tz) + timedelta(minutes=minutes)
     return now.isoformat(timespec="seconds")
 
 
-def local_midnight(day: date) -> datetime:
-    return datetime.combine(day, time.min).astimezone()
+def local_midnight(day: date, timezone_name: str | None = None) -> datetime:
+    tz = resolve_timezone(timezone_name)
+    return datetime.combine(day, time.min, tzinfo=tz)
 
 
-def local_end_of_day(day: date) -> datetime:
-    return local_midnight(day) + timedelta(days=1) - timedelta(seconds=1)
+def local_end_of_day(day: date, timezone_name: str | None = None) -> datetime:
+    tz = resolve_timezone(timezone_name)
+    return datetime.combine(day, time.max, tzinfo=tz)

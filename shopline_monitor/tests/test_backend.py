@@ -1,16 +1,21 @@
 import os
+import tempfile
 import unittest
 from datetime import date
+from pathlib import Path
 from unittest.mock import patch
 
+from shopline_monitor.env_loader import load_environment
 from shopline_monitor.backend import (
     ShoplineClient,
     ShoplineConfig,
     build_customer_summary,
     build_dashboard_payload,
     build_channels,
+    calculate_conversion_rate,
     build_order_query_params,
     build_url,
+    load_traffic_from_env,
     next_page_info_from_link,
     normalize_base_url,
     normalize_endpoint_path,
@@ -228,6 +233,54 @@ class BackendTests(unittest.TestCase):
         self.assertGreater(payload["kpis"]["orders"]["value"], 0)
         self.assertIn("SHOPLINE_API_BASE_URL", payload["connector"]["missing"])
 
+    def test_load_environment_reads_dotenv_without_overwriting_existing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "SHOPLINE_API_BASE_URL=https://example.com",
+                        'SHOPLINE_TIMEZONE="Asia/Tokyo"',
+                        'SHOPLINE_AD_SPEND_JSON={"Facebook":100}',
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"SHOPLINE_API_BASE_URL": "https://existing.example"}, clear=True):
+                loaded = load_environment([env_path])
+
+                self.assertEqual(os.environ["SHOPLINE_API_BASE_URL"], "https://existing.example")
+                self.assertEqual(os.environ["SHOPLINE_TIMEZONE"], "Asia/Tokyo")
+                self.assertEqual(os.environ["SHOPLINE_AD_SPEND_JSON"], '{"Facebook":100}')
+                self.assertNotIn("SHOPLINE_API_BASE_URL", loaded)
+
+    def test_traffic_env_drives_conversion_rate(self):
+        env = {
+            "SHOPLINE_TRAFFIC_JSON": '{"2026-06-17":{"visitors":200,"sessions":250}}',
+        }
+        with patch.dict(os.environ, env, clear=True):
+            traffic = load_traffic_from_env()
+
+        orders = [
+            {"createdAt": "2026-06-17", "total": 100},
+            {"createdAt": "2026-06-17", "total": 120},
+            {"createdAt": "2026-06-16", "total": 80},
+        ]
+
+        self.assertEqual(traffic["2026-06-17"]["visitors"], 200)
+        self.assertEqual(calculate_conversion_rate(orders, [{"date": "2026-06-17", "visitors": 200}]), 1.0)
+        self.assertEqual(
+            calculate_conversion_rate(orders, [{"date": "2026-06-17", "sessions": 250}], "sessions"),
+            0.8,
+        )
+
+    def test_conversion_rate_is_empty_without_real_traffic(self):
+        orders = [{"createdAt": "2026-06-17", "total": 100}]
+
+        self.assertIsNone(calculate_conversion_rate(orders, [{"date": "2026-06-17", "visitors": None}]))
+        self.assertIsNone(calculate_conversion_rate(orders, []))
+
     def test_build_url_adds_query_params(self):
         url = build_url("https://example.com/api", "/orders", {"limit": "1"})
 
@@ -257,6 +310,7 @@ class BackendTests(unittest.TestCase):
             "SHOPLINE_ORDERS_ENDPOINT": "/orders",
             "SHOPLINE_PRODUCTS_ENDPOINT": "/products",
             "SHOPLINE_DEFAULT_CURRENCY": "jpy",
+            "SHOPLINE_TIMEZONE": "Asia/Tokyo",
         }
         with patch.dict(os.environ, env, clear=True):
             config = ShoplineConfig.from_env()
@@ -269,6 +323,7 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(config.orders_path, "/orders.json")
         self.assertEqual(config.products_path, "/products/products.json")
         self.assertEqual(config.default_currency, "JPY")
+        self.assertEqual(config.timezone_name, "Asia/Tokyo")
 
     def test_order_query_params_include_any_status_and_recent_sort(self):
         params = build_order_query_params(date(2026, 6, 11), date(2026, 6, 17), limit=500)
@@ -404,6 +459,43 @@ class BackendTests(unittest.TestCase):
 
         self.assertEqual(client.order_calls, [(7, date(2026, 6, 17)), (7, date(2026, 6, 10))])
         self.assertEqual(payload["kpis"]["orders"]["value"], 1)
+
+    def test_live_dashboard_does_not_fake_conversion_without_traffic(self):
+        class FakeClient:
+            config = ShoplineConfig(default_currency="JPY")
+
+            def load_orders(self, days, today=None):
+                return {
+                    "items": [
+                        {
+                            "id": "order-1",
+                            "createdAt": "2026-06-17",
+                            "customer": "Guest",
+                            "source": "Direct",
+                            "market": "JP",
+                            "total": 100,
+                            "currency": "JPY",
+                            "status": "paid",
+                            "fulfillmentStatus": "unfulfilled",
+                            "units": 1,
+                            "items": [],
+                        }
+                    ],
+                    "source": "live",
+                    "error": None,
+                }
+
+            def load_products(self, today=None):
+                return {"items": [], "source": "live", "error": None}
+
+            def connector_status(self):
+                return {"configured": True, "missing": []}
+
+        with patch.dict(os.environ, {}, clear=True):
+            payload = build_dashboard_payload("1d", client=FakeClient(), today=date(2026, 6, 17))
+
+        self.assertIsNone(payload["kpis"]["conversion"]["value"])
+        self.assertEqual(payload["kpis"]["conversion"]["note"], "未配置真实访客数")
 
     def test_dashboard_supports_single_day_query(self):
         class FakeClient:
