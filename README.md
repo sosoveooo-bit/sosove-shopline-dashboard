@@ -43,4 +43,4 @@ $env:SHOPLINE_AD_SPEND_JSON = '{"Facebook":12000,"Instagram":8000,"Google":5000,
 3. Add the Shopline environment variables in **Project Settings -> Environment Variables**.
 4. Deploy.
 
-Vercel will detect the root `app.py` FastAPI app automatically. Do not add a `functions.app.py` entry to `vercel.json`; Vercel expects custom Python Serverless Function patterns to match files under `api/`. Every push to the connected branch triggers a new deployment.
+Vercel uses `api/index.py` as the Python Function entrypoint and rewrites all routes to the FastAPI app in `app.py`. Every push to the connected branch triggers a new deployment.
