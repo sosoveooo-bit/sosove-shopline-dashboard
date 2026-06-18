@@ -212,6 +212,7 @@ function render(payload) {
   renderChannels(payload.channels, payload.currency);
   renderProfit(payload.profit, payload.currency);
   renderAdPerformance(payload.adPerformance, payload.currency);
+  renderAnalytics(payload.analytics, payload.currency);
   renderCustomerInsights(payload.customers, payload.currency);
   renderOrderStatus(payload.orderStatus);
   renderProducts(payload.products, payload.currency);
@@ -292,6 +293,10 @@ function renderChart(series, currency) {
   const plotHeight = height - top - bottom;
   const maxRevenue = Math.max(1, ...series.map((row) => Number(row.revenue) || 0));
   const maxOrders = Math.max(1, ...series.map((row) => Number(row.orders) || 0));
+  const conversionValues = series
+    .map((row) => Number(row.conversion))
+    .filter((value) => Number.isFinite(value) && value >= 0);
+  const maxConversion = Math.max(1, ...conversionValues, 0.01);
   const step = series.length > 1 ? plotWidth / (series.length - 1) : plotWidth;
   const barWidth = Math.max(10, Math.min(34, plotWidth / series.length * 0.44));
   const baseY = top + plotHeight;
@@ -317,6 +322,18 @@ function renderChart(series, currency) {
     const y = baseY - barHeight;
     return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barWidth.toFixed(1)}" height="${barHeight.toFixed(1)}" rx="4" fill="#63d8ff" opacity="0.26"></rect>`;
   }).join("");
+
+  const conversionPoints = series
+    .map((row, index) => {
+      const value = Number(row.conversion);
+      if (!Number.isFinite(value)) return null;
+      const x = series.length === 1 ? left + plotWidth / 2 : left + index * step;
+      const y = top + plotHeight - (value / maxConversion) * (plotHeight * 0.86);
+      return { x, y, value };
+    })
+    .filter(Boolean);
+  const conversionLine = conversionPoints.map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(" ");
+  const conversionLabel = conversionPoints.length ? formatPercent(maxConversion) : "--";
 
   const labels = points.map((point, index) => {
     if (index % labelStep !== 0 && index !== points.length - 1) return "";
@@ -344,9 +361,12 @@ function renderChart(series, currency) {
       ${bars}
       <path d="${area}" fill="#4cffb1" opacity="0.11"></path>
       <polyline points="${line}" fill="none" stroke="#4cffb1" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" filter="url(#lineGlow)"></polyline>
+      ${conversionPoints.length ? `<polyline points="${conversionLine}" fill="none" stroke="#ffbf58" stroke-width="2.6" stroke-dasharray="8 7" stroke-linecap="round" stroke-linejoin="round"></polyline>` : ""}
       ${points.map((point) => `<circle cx="${point.x.toFixed(1)}" cy="${point.y.toFixed(1)}" r="4.5" fill="#071011" stroke="#4cffb1" stroke-width="2"></circle>`).join("")}
+      ${conversionPoints.map((point) => `<circle cx="${point.x.toFixed(1)}" cy="${point.y.toFixed(1)}" r="3.5" fill="#1b1510" stroke="#ffbf58" stroke-width="2"></circle>`).join("")}
       ${labels}
       <text x="${left}" y="18" class="chart-axis">${escapeHtml(revenueLabel)}</text>
+      <text x="${width / 2}" y="18" text-anchor="middle" class="chart-axis">转化峰值 ${escapeHtml(conversionLabel)}</text>
       <text x="${width - right}" y="18" text-anchor="end" class="chart-axis">订单峰值 ${maxOrders}</text>
     </svg>
   `;
@@ -388,6 +408,58 @@ function renderAdPerformance(rows, currency) {
     </tr>
   `);
   renderTable("ad-rows", tableRows, "暂无渠道数据", 5);
+}
+
+function renderAnalytics(analytics, currency) {
+  const comparisonNode = document.getElementById("chart-comparison");
+  const windowsNode = document.getElementById("chart-windows");
+  const funnelNode = document.getElementById("conversion-funnel");
+  if (!comparisonNode || !windowsNode || !funnelNode) return;
+
+  const comparisonRows = (analytics?.comparison || []).map((item) => {
+    const deltaText = item.delta === null || item.delta === undefined
+      ? "—"
+      : `${item.delta >= 0 ? "+" : ""}${formatNumber(item.delta)}%`;
+    return `
+      <article class="mini-card ${escapeHtml(item.tone || "neutral")}">
+        <span>${escapeHtml(item.label)}</span>
+        <strong>${formatMetric(item.value, item.type, currency)}</strong>
+        <small>${item.previous === null || item.previous === undefined ? "—" : `上期 ${formatMetric(item.previous, item.type, currency)}`}</small>
+        <em>${deltaText}</em>
+      </article>
+    `;
+  });
+  comparisonNode.innerHTML = comparisonRows.length
+    ? comparisonRows.join("")
+    : '<div class="empty compact">暂无对比数据</div>';
+
+  const windowRows = (analytics?.windows || []).map((item) => `
+    <article class="window-card">
+      <span>${escapeHtml(item.label)}</span>
+      <strong>${formatCurrency(item.revenue, currency)}</strong>
+      <small>${formatNumber(item.orders)} 单 · ${item.conversion === null || item.conversion === undefined ? "--" : formatPercent(item.conversion)}</small>
+    </article>
+  `);
+  windowsNode.innerHTML = windowRows.length
+    ? windowRows.join("")
+    : '<div class="empty compact">暂无周期数据</div>';
+
+  const funnelRows = (analytics?.funnel || []).map((step, index) => {
+    const fill = step.baseRate === null || step.baseRate === undefined ? 18 : Math.max(18, Math.min(100, Number(step.baseRate) || 0));
+    const baseRate = step.baseRate === null || step.baseRate === undefined ? "—" : `${formatNumber(step.baseRate)}%`;
+    const stepRate = step.stepRate === null || step.stepRate === undefined ? "—" : `${formatNumber(step.stepRate)}%`;
+    return `
+      <div class="funnel-step" style="--fill:${fill}%;">
+        <span>${escapeHtml(step.label)}</span>
+        <strong>${formatNumber(step.value)}</strong>
+        <small>${baseRate}${index > 0 ? ` · ${stepRate}` : ""}</small>
+        <i></i>
+      </div>
+    `;
+  });
+  funnelNode.innerHTML = funnelRows.length
+    ? funnelRows.join("")
+    : '<div class="empty compact">暂无漏斗数据</div>';
 }
 
 function renderCustomers(customers) {

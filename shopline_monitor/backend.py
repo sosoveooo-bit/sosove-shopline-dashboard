@@ -11,7 +11,7 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
 
@@ -341,23 +341,42 @@ def build_dashboard_payload(
     client = client or ShoplineClient()
     today = today or current_dashboard_date(client.config.timezone_name)
     days = resolve_range_days(range_key)
+    lookback_days = max(days, 30)
 
     current_start = today - timedelta(days=days - 1)
+    lookback_start = today - timedelta(days=lookback_days - 1)
     previous_start = current_start - timedelta(days=days)
     previous_end = current_start - timedelta(days=1)
+    year_end = today - timedelta(days=365)
+    year_start = year_end - timedelta(days=days - 1)
 
-    current_orders_result = client.load_orders(days, today=today)
+    current_orders_result = client.load_orders(lookback_days, today=today)
     previous_orders_result = client.load_orders(days, today=previous_end)
+    year_orders_result = client.load_orders(days, today=year_end)
     products_result = client.load_products(today=today)
     products = list(products_result["items"])
 
+    current_order_items = list(current_orders_result["items"])
     current_orders = filter_orders_by_window(
-        list(current_orders_result["items"]), current_start, today
+        current_order_items, current_start, today
+    )
+    lookback_orders = filter_orders_by_window(
+        current_order_items, lookback_start, today
     )
     previous_orders = filter_orders_by_window(
         list(previous_orders_result["items"]), previous_start, previous_end
     )
+    year_orders = filter_orders_by_window(
+        list(year_orders_result["items"]), year_start, year_end
+    )
     traffic_overrides = load_traffic_from_env()
+    lookback_traffic = build_traffic_series(
+        lookback_start,
+        today,
+        lookback_orders,
+        traffic_overrides=traffic_overrides,
+        sample_mode=current_orders_result.get("source") == "sample",
+    )
     current_traffic = build_traffic_series(
         current_start,
         today,
@@ -372,9 +391,23 @@ def build_dashboard_payload(
         traffic_overrides=traffic_overrides,
         sample_mode=previous_orders_result.get("source") == "sample",
     )
+    year_traffic = build_traffic_series(
+        year_start,
+        year_end,
+        year_orders,
+        traffic_overrides=traffic_overrides,
+        sample_mode=year_orders_result.get("source") == "sample",
+    )
     ga4_config = Ga4Config.from_env()
+    ga4_lookback = load_ga4_traffic_for_window(lookback_start, today)
     ga4_current = load_ga4_traffic_for_window(current_start, today)
     ga4_previous = load_ga4_traffic_for_window(previous_start, previous_end)
+    ga4_year = load_ga4_traffic_for_window(year_start, year_end)
+    lookback_ga4_rows = apply_ga4_conversion_mode(
+        ga4_lookback.rows,
+        lookback_orders,
+        ga4_config.conversion_mode,
+    )
     current_ga4_rows = apply_ga4_conversion_mode(
         ga4_current.rows,
         current_orders,
@@ -385,8 +418,15 @@ def build_dashboard_payload(
         previous_orders,
         ga4_config.conversion_mode,
     )
+    year_ga4_rows = apply_ga4_conversion_mode(
+        ga4_year.rows,
+        year_orders,
+        ga4_config.conversion_mode,
+    )
+    lookback_traffic = merge_traffic_series(lookback_traffic, lookback_ga4_rows)
     current_traffic = merge_traffic_series(current_traffic, current_ga4_rows)
     previous_traffic = merge_traffic_series(previous_traffic, previous_ga4_rows)
+    year_traffic = merge_traffic_series(year_traffic, year_ga4_rows)
 
     current_kpis = calculate_kpis(
         current_orders,
@@ -402,7 +442,15 @@ def build_dashboard_payload(
         conversion_traffic_field=client.config.conversion_traffic_field,
         conversion_override=ga4_conversion_rate(previous_ga4_rows, ga4_config.conversion_mode),
     )
+    year_kpis = calculate_kpis(
+        year_orders,
+        products,
+        year_traffic,
+        conversion_traffic_field=client.config.conversion_traffic_field,
+        conversion_override=ga4_conversion_rate(year_ga4_rows, ga4_config.conversion_mode),
+    )
     series = build_series(current_start, today, current_orders, current_traffic)
+    lookback_series = build_series(lookback_start, today, lookback_orders, lookback_traffic)
     channels = build_channels(current_orders)
     cost_config = CostConfig.from_env()
     ad_spend = load_ad_spend_from_env()
@@ -419,9 +467,12 @@ def build_dashboard_payload(
         for error in (
             current_orders_result.get("error"),
             previous_orders_result.get("error"),
+            year_orders_result.get("error"),
             products_result.get("error"),
+            ga4_lookback.error,
             ga4_current.error,
             ga4_previous.error,
+            ga4_year.error,
         )
         if error
     ]
@@ -458,6 +509,14 @@ def build_dashboard_payload(
             "lowStock": kpi_item("低库存 SKU", current_kpis["lowStock"], previous_kpis["lowStock"], "number"),
         },
         "series": series,
+        "analytics": build_chart_analytics(
+            current_kpis,
+            previous_kpis,
+            year_kpis,
+            lookback_series,
+            current_orders,
+            current_ga4_rows,
+        ),
         "channels": channels,
         "profit": profit,
         "adPerformance": ad_performance,
@@ -1519,6 +1578,145 @@ def build_series(
         )
         cursor += timedelta(days=1)
     return rows
+
+
+def build_chart_analytics(
+    current_kpis: dict[str, float | None],
+    previous_kpis: dict[str, float | None],
+    year_kpis: dict[str, float | None],
+    lookback_series: list[dict[str, Any]],
+    current_orders: list[dict[str, Any]],
+    current_ga4_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "comparison": [
+            comparison_item("销售额环比", current_kpis.get("revenue"), previous_kpis.get("revenue"), "currency"),
+            comparison_item("订单环比", current_kpis.get("orders"), previous_kpis.get("orders"), "number"),
+            comparison_item("转化率环比", current_kpis.get("conversion"), previous_kpis.get("conversion"), "percent"),
+            comparison_item(
+                "销售额同比",
+                current_kpis.get("revenue"),
+                year_kpis.get("revenue"),
+                "currency",
+                allow_zero_previous=False,
+            ),
+        ],
+        "windows": [
+            summarize_series_window("近 7 天", lookback_series[-7:]),
+            summarize_series_window("近 30 天", lookback_series[-30:]),
+        ],
+        "funnel": build_conversion_funnel(current_orders, current_ga4_rows),
+    }
+
+
+def comparison_item(
+    label: str,
+    current: float | None,
+    previous: float | None,
+    value_type: str,
+    allow_zero_previous: bool = True,
+) -> dict[str, Any]:
+    if previous in (None, 0) and not allow_zero_previous:
+        previous = None
+    delta = calculate_delta(current, previous)
+    return {
+        "label": label,
+        "value": round_number(current) if current is not None else None,
+        "previous": round_number(previous) if previous is not None else None,
+        "delta": round(delta, 1) if delta is not None else None,
+        "type": value_type,
+        "tone": "neutral" if delta is None else "positive" if delta >= 0 else "negative",
+    }
+
+
+def summarize_series_window(label: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    revenue = sum(float(row.get("revenue") or 0) for row in rows)
+    orders = sum(int(row.get("orders") or 0) for row in rows)
+    sessions = sum_optional_int(row.get("sessions") for row in rows)
+    key_events = sum_optional_float(row.get("keyEvents") for row in rows)
+    conversion_values = [
+        float(row.get("conversion"))
+        for row in rows
+        if row.get("conversion") is not None
+    ]
+    conversion = None
+    if sessions is not None and sessions > 0 and key_events is not None:
+        conversion = key_events / sessions * 100
+    elif conversion_values:
+        conversion = sum(conversion_values) / len(conversion_values)
+
+    return {
+        "label": label,
+        "days": len(rows),
+        "revenue": round_number(revenue),
+        "orders": orders,
+        "aov": round_number(revenue / orders if orders else 0),
+        "sessions": sessions,
+        "conversion": round_number(conversion) if conversion is not None else None,
+    }
+
+
+def build_conversion_funnel(
+    orders: list[dict[str, Any]],
+    ga4_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    sessions = sum_optional_int(row.get("sessions") for row in ga4_rows)
+    active_users = sum_optional_int(row.get("activeUsers") for row in ga4_rows)
+    key_events = sum_optional_float(row.get("keyEvents") for row in ga4_rows)
+    shopline_orders = len(orders)
+
+    raw_steps = [
+        ("访问会话", sessions),
+        ("活跃用户", active_users),
+        ("GA4 Purchase", key_events),
+        ("Shopline 订单", shopline_orders),
+    ]
+    available_steps = [(label, value) for label, value in raw_steps if value is not None]
+    if not available_steps:
+        available_steps = [("Shopline 订单", shopline_orders)]
+
+    base_value = float(available_steps[0][1] or 0)
+    previous_value: float | None = None
+    steps = []
+    for label, value in available_steps:
+        numeric_value = float(value or 0)
+        steps.append(
+            {
+                "label": label,
+                "value": round_number(numeric_value),
+                "baseRate": round_number(numeric_value / base_value * 100) if base_value > 0 else None,
+                "stepRate": (
+                    round_number(numeric_value / previous_value * 100)
+                    if previous_value and previous_value > 0
+                    else None
+                ),
+            }
+        )
+        previous_value = numeric_value
+    return steps
+
+
+def sum_optional_int(values: Iterable[Any]) -> int | None:
+    total = 0
+    found = False
+    for value in values:
+        if value is None:
+            continue
+        total += parse_int(value)
+        found = True
+    return total if found else None
+
+
+def sum_optional_float(values: Iterable[Any]) -> float | None:
+    total = 0.0
+    found = False
+    for value in values:
+        parsed = parse_optional_float(value)
+        if parsed is None:
+            continue
+        total += parsed
+        found = True
+    return round_number(total) if found else None
 
 
 def build_channels(orders: list[dict[str, Any]]) -> list[dict[str, Any]]:

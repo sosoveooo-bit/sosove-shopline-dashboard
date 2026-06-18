@@ -534,7 +534,14 @@ class BackendTests(unittest.TestCase):
         client = FakeClient()
         payload = build_dashboard_payload("7d", client=client, today=date(2026, 6, 17))
 
-        self.assertEqual(client.order_calls, [(7, date(2026, 6, 17)), (7, date(2026, 6, 10))])
+        self.assertEqual(
+            client.order_calls,
+            [
+                (30, date(2026, 6, 17)),
+                (7, date(2026, 6, 10)),
+                (7, date(2025, 6, 17)),
+            ],
+        )
         self.assertEqual(payload["kpis"]["orders"]["value"], 1)
 
     def test_live_dashboard_does_not_fake_conversion_without_traffic(self):
@@ -629,17 +636,21 @@ class BackendTests(unittest.TestCase):
             ],
             error=None,
         )
+        ga4_empty = Ga4TrafficResult(rows=[], error=None)
 
         with patch.dict(os.environ, {"GA4_CONVERSION_MODE": "key_event_rate"}, clear=True):
             with patch(
                 "shopline_monitor.backend.load_ga4_traffic_for_window",
-                side_effect=[ga4_current, ga4_previous],
+                side_effect=[ga4_current, ga4_current, ga4_previous, ga4_empty],
             ):
                 payload = build_dashboard_payload("1d", client=FakeClient(), today=date(2026, 6, 17))
 
         self.assertEqual(payload["kpis"]["conversion"]["value"], 12.5)
         self.assertEqual(payload["series"][0]["conversion"], 12.5)
         self.assertEqual(payload["series"][0]["sessions"], 200)
+        self.assertIn("analytics", payload)
+        self.assertEqual(payload["analytics"]["comparison"][0]["label"], "销售额环比")
+        self.assertEqual([row["label"] for row in payload["analytics"]["windows"]], ["近 7 天", "近 30 天"])
 
     def test_live_dashboard_defaults_to_ga4_key_event_rate(self):
         class FakeClient:
@@ -680,11 +691,12 @@ class BackendTests(unittest.TestCase):
             rows=[{"date": "2026-06-16", "sessions": 100, "conversion": 8.0, "source": "ga4"}],
             error=None,
         )
+        ga4_empty = Ga4TrafficResult(rows=[], error=None)
 
         with patch.dict(os.environ, {}, clear=True):
             with patch(
                 "shopline_monitor.backend.load_ga4_traffic_for_window",
-                side_effect=[ga4_current, ga4_previous],
+                side_effect=[ga4_current, ga4_current, ga4_previous, ga4_empty],
             ):
                 payload = build_dashboard_payload("1d", client=FakeClient(), today=date(2026, 6, 17))
 
@@ -735,7 +747,14 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(payload["series"][0]["date"], "2026-06-17")
         self.assertEqual(payload["series"][0]["orders"], 1)
         self.assertEqual(payload["series"][0]["revenue"], 100)
-        self.assertEqual(client.order_calls, [(1, date(2026, 6, 17)), (1, date(2026, 6, 16))])
+        self.assertEqual(
+            client.order_calls,
+            [
+                (30, date(2026, 6, 17)),
+                (1, date(2026, 6, 16)),
+                (1, date(2025, 6, 17)),
+            ],
+        )
 
     def test_dashboard_recent_orders_show_full_end_day_only(self):
         class FakeClient:

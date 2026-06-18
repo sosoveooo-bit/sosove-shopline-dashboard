@@ -1788,6 +1788,134 @@ button {
   animation: chartBlink 4.5s ease-in-out infinite;
 }
 
+.analytics-stack {
+  display: grid;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.chart-comparison,
+.chart-windows,
+.funnel-strip {
+  display: grid;
+  gap: 8px;
+}
+
+.chart-comparison {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.chart-windows {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.funnel-wrap {
+  display: grid;
+  gap: 8px;
+  padding: 10px 0 0;
+}
+
+.funnel-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.funnel-header span {
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 850;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.funnel-header small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.mini-card,
+.window-card,
+.funnel-step {
+  position: relative;
+  min-width: 0;
+  padding: 10px 11px;
+  overflow: hidden;
+  background:
+    linear-gradient(135deg, rgba(76, 255, 177, 0.05), rgba(99, 216, 255, 0.02)),
+    rgba(255, 255, 255, 0.02);
+  border: 1px solid rgba(123, 255, 212, 0.1);
+  border-radius: var(--radius);
+}
+
+.mini-card span,
+.window-card span,
+.funnel-step span {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.mini-card strong,
+.window-card strong,
+.funnel-step strong {
+  display: block;
+  margin-top: 4px;
+  color: var(--ink);
+  font-size: 18px;
+  font-weight: 850;
+  line-height: 1.05;
+}
+
+.mini-card small,
+.window-card small,
+.funnel-step small {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.mini-card em {
+  display: inline-flex;
+  margin-top: 6px;
+  font-style: normal;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.mini-card.positive em,
+.window-card.positive strong,
+.funnel-step i {
+  color: var(--green);
+}
+
+.mini-card.negative em {
+  color: var(--red);
+}
+
+.mini-card.neutral em {
+  color: var(--amber);
+}
+
+.funnel-step i {
+  display: block;
+  width: var(--fill, 18%);
+  height: 3px;
+  margin-top: 8px;
+  background: linear-gradient(90deg, var(--amber), var(--green));
+  border-radius: 999px;
+  box-shadow: 0 0 16px rgba(255, 191, 88, 0.25);
+}
+
+.chart-axis,
+.chart-canvas text {
+  fill: var(--muted);
+}
+
 .connector-list {
   display: grid;
   gap: 0;
@@ -2237,11 +2365,28 @@ td strong {
 
 @media (max-width: 640px) {
   .page-title h1 {
-    font-size: 28px;
+    font-size: 24px;
+    line-height: 1.1;
+  }
+
+  .content {
+    padding: 12px;
   }
 
   .topbar {
-    padding: 18px;
+    padding: 14px;
+  }
+
+  .panel {
+    padding: 14px;
+  }
+
+  .layout-grid,
+  .bottom-grid,
+  .ops-grid,
+  .insight-grid {
+    gap: 10px;
+    margin-bottom: 10px;
   }
 
   .topbar::before,
@@ -2253,8 +2398,27 @@ td strong {
     gap: 6px;
   }
 
+  .nav-links {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+
   .kpi-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .metric-card {
+    min-height: 128px;
+    padding: 13px;
+  }
+
+  .metric-card h2 {
+    font-size: 15px;
+  }
+
+  .metric-card strong {
+    font-size: 24px;
   }
 
   .toolbar,
@@ -2301,13 +2465,47 @@ td strong {
   }
 
   .status-rail {
-    grid-template-columns: 1fr;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
   }
 
   .finance-grid,
-  .mini-grid,
   .order-tools {
     grid-template-columns: 1fr;
+  }
+
+  .mini-grid,
+  .chart-comparison,
+  .chart-windows,
+  .funnel-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .chart-canvas {
+    min-height: 268px;
+    padding: 6px 4px 0;
+  }
+
+  .chart-canvas svg {
+    height: 260px;
+  }
+
+  .mini-card,
+  .window-card,
+  .funnel-step {
+    padding: 9px;
+  }
+
+  .mini-card strong,
+  .window-card strong,
+  .funnel-step strong {
+    font-size: 16px;
+  }
+
+  .funnel-header {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 2px;
   }
 
   .connector-list div {
@@ -2338,15 +2536,15 @@ td strong {
 
   tbody {
     display: grid;
-    gap: 10px;
+    gap: 8px;
   }
 
   tbody tr {
     position: relative;
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 8px 10px;
-    padding: 12px;
+    gap: 6px 8px;
+    padding: 10px;
     background:
       linear-gradient(135deg, rgba(76, 255, 177, 0.055), rgba(99, 216, 255, 0.025)),
       rgba(255, 255, 255, 0.018);
@@ -2370,7 +2568,7 @@ td strong {
     padding: 0;
     border-bottom: 0;
     color: var(--ink-soft);
-    font-size: 12px;
+    font-size: 11.5px;
   }
 
   td::before {
@@ -2394,7 +2592,7 @@ td strong {
 
   td strong {
     max-width: none;
-    font-size: 13px;
+    font-size: 12.5px;
     line-height: 1.45;
   }
 
@@ -2422,6 +2620,25 @@ td strong {
 
   .empty {
     line-height: 1.45;
+  }
+}
+
+@media (max-width: 360px) {
+  .kpi-grid,
+  .status-rail,
+  .mini-grid,
+  .chart-comparison,
+  .chart-windows,
+  .funnel-strip {
+    grid-template-columns: 1fr;
+  }
+
+  .metric-card {
+    min-height: 116px;
+  }
+
+  .command-strip {
+    grid-template-columns: 1fr;
   }
 }
 
