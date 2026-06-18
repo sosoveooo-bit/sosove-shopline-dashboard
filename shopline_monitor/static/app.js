@@ -212,7 +212,6 @@ function render(payload) {
   renderChannels(payload.channels, payload.currency);
   renderProfit(payload.profit, payload.currency);
   renderAdPerformance(payload.adPerformance, payload.currency);
-  renderCampaignBreakdown(payload.campaigns, payload.currency);
   renderCustomerInsights(payload.customers, payload.currency);
   renderOrderStatus(payload.orderStatus);
   renderProducts(payload.products, payload.currency);
@@ -389,48 +388,6 @@ function renderAdPerformance(rows, currency) {
     </tr>
   `);
   renderTable("ad-rows", tableRows, "暂无渠道数据", 5);
-}
-
-function renderCampaignBreakdown(rows, currency) {
-  const safeRows = Array.isArray(rows) ? rows : [];
-  const totalOrders = safeRows.reduce((sum, row) => sum + (Number(row.orders) || 0), 0);
-  setText("campaign-summary", safeRows.length ? `${formatNumber(totalOrders)} 单 / ${formatNumber(safeRows.length)} 组` : "待采集");
-
-  const tableRows = safeRows.map((row) => {
-    const campaignPrimary = row.campaignId || row.utmCampaign || "未标记广告系列";
-    const campaignSecondary = compactParts([
-      row.campaignId ? `campaign_id ${row.campaignId}` : "",
-      row.utmCampaign ? `utm_campaign ${row.utmCampaign}` : "",
-    ]).join(" · ");
-    const adsetText = row.adsetId || "未标记广告组";
-    const adText = row.adId || row.utmContent || "未标记广告";
-    const adSecondary = compactParts([
-      row.adId ? `ad_id ${row.adId}` : "",
-      row.utmContent ? `utm_content ${row.utmContent}` : "",
-    ]).join(" · ");
-
-    return `
-      <tr>
-        <td data-label="渠道">
-          <strong>${escapeHtml(row.channel || "--")}</strong>
-          <span class="empty">${escapeHtml(compactParts([row.utmSource, row.utmMedium]).join(" / ") || "last touch")}</span>
-        </td>
-        <td data-label="广告系列">
-          <strong title="${escapeHtml(campaignPrimary)}">${escapeHtml(campaignPrimary)}</strong>
-          <span class="empty">${escapeHtml(campaignSecondary || "--")}</span>
-        </td>
-        <td data-label="广告组"><span class="mono-cell">${escapeHtml(adsetText)}</span></td>
-        <td data-label="广告">
-          <span class="mono-cell">${escapeHtml(adText)}</span>
-          <span class="empty">${escapeHtml(adSecondary || "--")}</span>
-        </td>
-        <td data-label="订单">${formatNumber(row.orders)}</td>
-        <td data-label="销售额">${formatCurrency(row.revenue, currency)}</td>
-        <td data-label="客单价">${formatCurrency(row.aov, currency)}</td>
-      </tr>
-    `;
-  });
-  renderTable("campaign-rows", tableRows, "暂无广告系列数据", 7);
 }
 
 function renderCustomers(customers) {
@@ -701,12 +658,6 @@ function renderTable(id, rows, emptyText, colspan) {
   node.innerHTML = rows.length
     ? rows.join("")
     : `<tr><td colspan="${colspan}" class="empty">${escapeHtml(emptyText)}</td></tr>`;
-}
-
-function compactParts(parts) {
-  return parts
-    .map((part) => String(part || "").trim())
-    .filter(Boolean);
 }
 
 function formatMetric(value, type, currency) {

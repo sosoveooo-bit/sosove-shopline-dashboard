@@ -641,12 +641,6 @@ body::after {
   background: linear-gradient(90deg, var(--blue), var(--green), var(--amber));
 }
 
-:root[data-theme="light"] .mono-cell {
-  color: #111827;
-  background: rgba(94, 123, 255, 0.08);
-  border-color: rgba(94, 123, 255, 0.14);
-}
-
 button,
 input,
 select {
@@ -1498,10 +1492,6 @@ button {
   grid-template-columns: minmax(0, 1fr) minmax(320px, 0.85fr);
 }
 
-.campaign-panel {
-  margin-bottom: 14px;
-}
-
 .panel {
   position: relative;
   min-width: 0;
@@ -1842,10 +1832,6 @@ table {
   min-width: 560px;
 }
 
-.campaign-table-wrap table {
-  min-width: 940px;
-}
-
 th,
 td {
   padding: 12px 10px;
@@ -1881,22 +1867,6 @@ td strong {
   max-width: 280px;
   overflow-wrap: anywhere;
   color: var(--ink);
-}
-
-.mono-cell {
-  display: inline-block;
-  max-width: 220px;
-  padding: 3px 7px;
-  overflow: hidden;
-  color: var(--cyan);
-  text-overflow: ellipsis;
-  vertical-align: middle;
-  white-space: nowrap;
-  background: rgba(99, 216, 255, 0.07);
-  border: 1px solid rgba(99, 216, 255, 0.13);
-  border-radius: 7px;
-  font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
-  font-size: 12px;
 }
 
 .order-tools {
