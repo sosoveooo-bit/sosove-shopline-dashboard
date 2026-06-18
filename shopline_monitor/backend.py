@@ -25,6 +25,10 @@ DEFAULT_PRODUCT_COST_RATE = 0.35
 DEFAULT_PAYMENT_FEE_RATE = 0.036
 DEFAULT_SHIPPING_COST_PER_ORDER = 0.0
 DEFAULT_CONVERSION_TRAFFIC_FIELD = "visitors"
+DEFAULT_GA4_KEY_EVENT_NAME = "purchase"
+DEFAULT_GA4_CONVERSION_METRIC = "userKeyEventRate"
+DEFAULT_GA4_CONVERSION_MODE = "key_event_rate"
+GA4_READONLY_SCOPE = "https://www.googleapis.com/auth/analytics.readonly"
 TRAFFIC_SOURCE_BUCKETS = {
     "Facebook",
     "Instagram",
@@ -119,6 +123,65 @@ class CostConfig:
         )
 
 
+@dataclass(frozen=True)
+class Ga4Config:
+    property_id: str = ""
+    service_account_json: str = ""
+    service_account_file: str = ""
+    key_event_name: str = DEFAULT_GA4_KEY_EVENT_NAME
+    conversion_metric: str = DEFAULT_GA4_CONVERSION_METRIC
+    conversion_mode: str = DEFAULT_GA4_CONVERSION_MODE
+    timeout_seconds: float = 12.0
+
+    @classmethod
+    def from_env(cls) -> "Ga4Config":
+        timeout_raw = os.getenv("GA4_TIMEOUT_SECONDS", "12")
+        try:
+            timeout_seconds = max(1.0, float(timeout_raw))
+        except ValueError:
+            timeout_seconds = 12.0
+        return cls(
+            property_id=os.getenv("GA4_PROPERTY_ID", "").strip(),
+            service_account_json=os.getenv("GA4_SERVICE_ACCOUNT_JSON", "").strip(),
+            service_account_file=os.getenv("GA4_SERVICE_ACCOUNT_FILE", "").strip(),
+            key_event_name=(
+                os.getenv("GA4_KEY_EVENT_NAME", DEFAULT_GA4_KEY_EVENT_NAME).strip()
+                or DEFAULT_GA4_KEY_EVENT_NAME
+            ),
+            conversion_metric=normalize_ga4_metric(
+                os.getenv("GA4_CONVERSION_METRIC", DEFAULT_GA4_CONVERSION_METRIC)
+            ),
+            conversion_mode=normalize_ga4_conversion_mode(
+                os.getenv("GA4_CONVERSION_MODE", DEFAULT_GA4_CONVERSION_MODE)
+            ),
+            timeout_seconds=timeout_seconds,
+        )
+
+    @property
+    def credential_source(self) -> str:
+        if self.service_account_json:
+            return "json"
+        if self.service_account_file:
+            return "file"
+        if os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip():
+            return "adc"
+        return "missing"
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.property_id and self.credential_source != "missing")
+
+    @property
+    def metric_name(self) -> str:
+        return f"{self.conversion_metric}:{self.key_event_name}"
+
+
+@dataclass(frozen=True)
+class Ga4TrafficResult:
+    rows: list[dict[str, Any]]
+    error: str | None = None
+
+
 class ShoplineClient:
     def __init__(self, config: ShoplineConfig | None = None):
         self.config = config or ShoplineConfig.from_env()
@@ -135,6 +198,7 @@ class ShoplineClient:
             missing.append("SHOPLINE_PRODUCTS_ENDPOINT")
 
         mode = "live" if self.config.live_ready else "sample"
+        ga4_config = Ga4Config.from_env()
         return {
             "mode": mode,
             "configured": self.config.live_ready,
@@ -151,6 +215,15 @@ class ShoplineClient:
             "conversionTrafficField": self.config.conversion_traffic_field,
             "maxOrderPages": self.config.max_order_pages,
             "missing": missing,
+            "ga4": {
+                "configured": ga4_config.configured,
+                "propertyId": ga4_config.property_id,
+                "keyEventName": ga4_config.key_event_name,
+                "metricName": ga4_config.metric_name,
+                "conversionMode": ga4_config.conversion_mode,
+                "credentialSource": ga4_config.credential_source,
+                "timeoutSeconds": ga4_config.timeout_seconds,
+            },
         }
 
     def load_orders(self, days: int, today: date | None = None) -> dict[str, Any]:
@@ -299,26 +372,45 @@ def build_dashboard_payload(
         traffic_overrides=traffic_overrides,
         sample_mode=previous_orders_result.get("source") == "sample",
     )
+    ga4_config = Ga4Config.from_env()
+    ga4_current = load_ga4_traffic_for_window(current_start, today)
+    ga4_previous = load_ga4_traffic_for_window(previous_start, previous_end)
+    current_ga4_rows = apply_ga4_conversion_mode(
+        ga4_current.rows,
+        current_orders,
+        ga4_config.conversion_mode,
+    )
+    previous_ga4_rows = apply_ga4_conversion_mode(
+        ga4_previous.rows,
+        previous_orders,
+        ga4_config.conversion_mode,
+    )
+    current_traffic = merge_traffic_series(current_traffic, current_ga4_rows)
+    previous_traffic = merge_traffic_series(previous_traffic, previous_ga4_rows)
 
     current_kpis = calculate_kpis(
         current_orders,
         products,
         current_traffic,
         conversion_traffic_field=client.config.conversion_traffic_field,
+        conversion_override=ga4_conversion_rate(current_ga4_rows, ga4_config.conversion_mode),
     )
     previous_kpis = calculate_kpis(
         previous_orders,
         products,
         previous_traffic,
         conversion_traffic_field=client.config.conversion_traffic_field,
+        conversion_override=ga4_conversion_rate(previous_ga4_rows, ga4_config.conversion_mode),
     )
     series = build_series(current_start, today, current_orders, current_traffic)
     channels = build_channels(current_orders)
     cost_config = CostConfig.from_env()
     ad_spend = load_ad_spend_from_env()
     profit = build_profit_summary(current_orders, channels, cost_config, ad_spend)
+    ad_performance = build_ad_performance(channels, ad_spend)
     customers = build_customer_summary(current_orders)
     order_status = build_order_status_summary(current_orders)
+    product_rows = build_product_rows(current_orders, products)
     source_mode = source_mode_from_results(
         current_orders_result, previous_orders_result, products_result
     )
@@ -328,6 +420,8 @@ def build_dashboard_payload(
             current_orders_result.get("error"),
             previous_orders_result.get("error"),
             products_result.get("error"),
+            ga4_current.error,
+            ga4_previous.error,
         )
         if error
     ]
@@ -366,12 +460,23 @@ def build_dashboard_payload(
         "series": series,
         "channels": channels,
         "profit": profit,
-        "adPerformance": build_ad_performance(channels, ad_spend),
+        "adPerformance": ad_performance,
         "customers": customers,
         "orderStatus": order_status,
-        "products": build_product_rows(current_orders, products),
+        "products": product_rows,
         "orders": build_recent_orders(filter_orders_by_window(current_orders, today, today)),
-        "alerts": build_alerts(current_kpis, current_orders, products, source_mode, errors),
+        "alerts": build_alerts_v2(
+            current_kpis,
+            current_orders,
+            products,
+            source_mode,
+            errors,
+            previous_kpis=previous_kpis,
+            product_rows=product_rows,
+            ad_performance=ad_performance,
+            order_status=order_status,
+            series=series,
+        ),
         "events": build_events(source_mode, current_kpis, errors, client.config.timezone_name),
         "connector": client.connector_status(),
     }
@@ -463,10 +568,15 @@ def calculate_kpis(
     products: list[dict[str, Any]],
     traffic: list[dict[str, Any]],
     conversion_traffic_field: str = DEFAULT_CONVERSION_TRAFFIC_FIELD,
+    conversion_override: float | None = None,
 ) -> dict[str, float | None]:
     revenue = sum(float(order.get("total", 0)) for order in orders)
     order_count = len(orders)
-    conversion = calculate_conversion_rate(orders, traffic, conversion_traffic_field)
+    conversion = (
+        conversion_override
+        if conversion_override is not None
+        else calculate_conversion_rate(orders, traffic, conversion_traffic_field)
+    )
     units = sum(int(order.get("units", 0)) for order in orders)
     low_stock = sum(1 for product in products if int(product.get("inventory", 0)) <= 5)
     return {
@@ -966,6 +1076,241 @@ def normalize_traffic_field(value: Any) -> str:
     return "sessions" if field == "sessions" else "visitors"
 
 
+def normalize_ga4_metric(value: Any) -> str:
+    raw = str(value or "").strip()
+    compact = raw.replace("_", "").replace("-", "").lower()
+    if compact in {"user", "userkeyeventrate", "userconversionrate"}:
+        return "userKeyEventRate"
+    if compact in {"session", "sessionkeyeventrate", "sessionconversionrate", "conversionrate"}:
+        return "sessionKeyEventRate"
+    if raw in {"sessionKeyEventRate", "userKeyEventRate"}:
+        return raw
+    return DEFAULT_GA4_CONVERSION_METRIC
+
+
+def normalize_ga4_conversion_mode(value: Any) -> str:
+    raw = str(value or "").strip().lower().replace("-", "_")
+    if raw in {"key_event_rate", "ga4_key_event_rate"}:
+        return "key_event_rate"
+    if raw in {"shopline_orders_over_sessions", "orders_over_sessions", "shopline_orders"}:
+        return "shopline_orders_over_sessions"
+    if raw in {"shopline_orders_over_active_users", "orders_over_active_users"}:
+        return "shopline_orders_over_active_users"
+    if raw in {"shopline_orders_over_total_users", "orders_over_total_users"}:
+        return "shopline_orders_over_total_users"
+    return DEFAULT_GA4_CONVERSION_MODE
+
+
+def load_ga4_traffic_for_window(start: date, end: date) -> Ga4TrafficResult:
+    config = Ga4Config.from_env()
+    if not config.configured:
+        return Ga4TrafficResult(rows=[])
+    try:
+        return Ga4TrafficResult(rows=fetch_ga4_traffic_series(config, start, end))
+    except Exception as exc:  # pragma: no cover - network and credential specific branch
+        return Ga4TrafficResult(rows=[], error=f"GA4: {exc.__class__.__name__}: {exc}")
+
+
+def fetch_ga4_traffic_series(
+    config: Ga4Config,
+    start: date,
+    end: date,
+) -> list[dict[str, Any]]:
+    try:
+        from google.analytics.data_v1beta import BetaAnalyticsDataClient
+        from google.analytics.data_v1beta.types import DateRange, Dimension, Metric, RunReportRequest
+        from google.oauth2 import service_account
+    except ImportError as exc:  # pragma: no cover - depends on optional package availability
+        raise RuntimeError("google-analytics-data is not installed") from exc
+
+    credentials = None
+    if config.service_account_json:
+        credentials = service_account.Credentials.from_service_account_info(
+            json.loads(config.service_account_json),
+            scopes=[GA4_READONLY_SCOPE],
+        )
+    elif config.service_account_file:
+        credentials = service_account.Credentials.from_service_account_file(
+            config.service_account_file,
+            scopes=[GA4_READONLY_SCOPE],
+        )
+
+    client = BetaAnalyticsDataClient(credentials=credentials)
+    request = RunReportRequest(
+        property=ga4_property_name(config.property_id),
+        date_ranges=[DateRange(start_date=start.isoformat(), end_date=end.isoformat())],
+        dimensions=[Dimension(name="date")],
+        metrics=[
+            Metric(name="sessions"),
+            Metric(name="activeUsers"),
+            Metric(name="totalUsers"),
+            Metric(name=f"keyEvents:{config.key_event_name}"),
+            Metric(name=config.metric_name),
+        ],
+    )
+    response = client.run_report(request=request, timeout=config.timeout_seconds)
+    return normalize_ga4_rows(response, config.metric_name)
+
+
+def ga4_property_name(property_id: str) -> str:
+    clean = str(property_id or "").strip()
+    if clean.startswith("properties/"):
+        return clean
+    return f"properties/{clean}"
+
+
+def normalize_ga4_rows(response: Any, metric_name: str) -> list[dict[str, Any]]:
+    dimensions = [header.name for header in getattr(response, "dimension_headers", [])]
+    metrics = [header.name for header in getattr(response, "metric_headers", [])]
+    rows = []
+    for row in getattr(response, "rows", []):
+        dimension_values = getattr(row, "dimension_values", [])
+        metric_values = getattr(row, "metric_values", [])
+        dimension_map = {
+            dimensions[index]: value.value
+            for index, value in enumerate(dimension_values)
+            if index < len(dimensions)
+        }
+        metric_map = {
+            metrics[index]: value.value
+            for index, value in enumerate(metric_values)
+            if index < len(metrics)
+        }
+        day = normalize_ga4_date(dimension_map.get("date"))
+        if not day:
+            continue
+        key_events = metric_map.get("keyEvents")
+        if key_events is None:
+            key_events = next(
+                (value for key, value in metric_map.items() if key.startswith("keyEvents")),
+                None,
+            )
+        rows.append(
+            {
+                "date": day,
+                "visitors": None,
+                "sessions": max(0, parse_int(metric_map.get("sessions"))),
+                "activeUsers": max(0, parse_int(metric_map.get("activeUsers"))),
+                "totalUsers": max(0, parse_int(metric_map.get("totalUsers"))),
+                "keyEvents": max(0, parse_optional_float(key_events) or 0),
+                "conversion": normalize_ga4_rate(metric_map.get(metric_name)),
+                "source": "ga4",
+            }
+        )
+    return sorted(rows, key=lambda row: row["date"])
+
+
+def normalize_ga4_date(value: Any) -> str:
+    text = str(value or "").strip()
+    if re.fullmatch(r"\d{8}", text):
+        return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
+    parsed = parse_date(text)
+    return parsed.isoformat() if parsed else ""
+
+
+def normalize_ga4_rate(value: Any) -> float | None:
+    rate = parse_optional_float(value)
+    if rate is None:
+        return None
+    if abs(rate) <= 1:
+        rate *= 100
+    return round_number(rate)
+
+
+def apply_ga4_conversion_mode(
+    rows: list[dict[str, Any]],
+    orders: list[dict[str, Any]],
+    mode: str,
+) -> list[dict[str, Any]]:
+    normalized_mode = normalize_ga4_conversion_mode(mode)
+    if normalized_mode == "key_event_rate":
+        return [dict(row, conversionMode=normalized_mode) for row in rows]
+
+    order_counts: dict[str, int] = {}
+    for order in orders:
+        key = str(order.get("createdAt", ""))[:10]
+        if key:
+            order_counts[key] = order_counts.get(key, 0) + 1
+
+    denominator_field = ga4_denominator_field(normalized_mode)
+    converted = []
+    for row in rows:
+        next_row = dict(row)
+        order_count = order_counts.get(str(row.get("date")), 0)
+        denominator = parse_int(row.get(denominator_field))
+        next_row["shoplineOrders"] = order_count
+        next_row["conversionMode"] = normalized_mode
+        next_row["conversionDenominatorField"] = denominator_field
+        next_row["conversion"] = (
+            round_number(order_count / denominator * 100)
+            if denominator > 0
+            else None
+        )
+        converted.append(next_row)
+    return converted
+
+
+def ga4_denominator_field(mode: str) -> str:
+    normalized_mode = normalize_ga4_conversion_mode(mode)
+    if normalized_mode == "shopline_orders_over_active_users":
+        return "activeUsers"
+    if normalized_mode == "shopline_orders_over_total_users":
+        return "totalUsers"
+    return "sessions"
+
+
+def ga4_conversion_rate(
+    rows: list[dict[str, Any]],
+    mode: str = "key_event_rate",
+) -> float | None:
+    denominator_field = ga4_denominator_field(mode)
+    weighted_total = 0.0
+    denominator_total = 0
+    fallback_values = []
+    for row in rows:
+        conversion = parse_optional_float(row.get("conversion"))
+        if conversion is None:
+            continue
+        fallback_values.append(conversion)
+        denominator = parse_int(row.get(denominator_field))
+        if denominator > 0:
+            weighted_total += conversion * denominator
+            denominator_total += denominator
+    if denominator_total > 0:
+        return round_number(weighted_total / denominator_total)
+    if fallback_values:
+        return round_number(sum(fallback_values) / len(fallback_values))
+    return None
+
+
+def merge_traffic_series(
+    base_rows: list[dict[str, Any]],
+    override_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    overrides = {str(row.get("date")): row for row in override_rows}
+    merged = []
+    for row in base_rows:
+        next_row = dict(row)
+        override = overrides.get(str(row.get("date")))
+        if override:
+            for field in (
+                "visitors",
+                "sessions",
+                "activeUsers",
+                "totalUsers",
+                "keyEvents",
+                "shoplineOrders",
+                "conversion",
+                "conversionMode",
+                "conversionDenominatorField",
+            ):
+                if override.get(field) is not None:
+                    next_row[field] = override[field]
+            next_row["source"] = str(override.get("source") or "ga4")
+        merged.append(next_row)
+    return merged
+
+
 def conversion_note(value: float | None) -> str:
     return "" if value is not None else "未配置真实访客数"
 
@@ -1005,6 +1350,23 @@ def parse_amount(value: Any) -> float:
         return float(Decimal(text))
     except (InvalidOperation, ValueError):
         return 0.0
+
+
+def parse_optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and math.isnan(value):
+            return None
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    text = text.replace(",", "")
+    try:
+        return float(Decimal(text))
+    except (InvalidOperation, ValueError):
+        return None
 
 
 def parse_int(value: Any, default: int = 0) -> int:
@@ -1117,13 +1479,29 @@ def build_series(
         key = cursor.isoformat()
         day_orders = order_map.get(key, [])
         revenue = sum(float(order.get("total", 0)) for order in day_orders)
-        visitor_value = traffic_map.get(key, {}).get("visitors")
+        traffic_row = traffic_map.get(key, {})
+        visitor_value = traffic_row.get("visitors")
+        session_value = traffic_row.get("sessions")
         visitors = parse_int(visitor_value) if visitor_value is not None else None
-        conversion = (
-            round_number((len(day_orders) / visitors * 100))
-            if visitors and visitors > 0
-            else None
+        sessions = parse_int(session_value) if session_value is not None else None
+        active_users_value = traffic_row.get("activeUsers")
+        total_users_value = traffic_row.get("totalUsers")
+        key_events_value = traffic_row.get("keyEvents")
+        shopline_orders_value = traffic_row.get("shoplineOrders")
+        active_users = (
+            parse_int(active_users_value) if active_users_value is not None else None
         )
+        total_users = parse_int(total_users_value) if total_users_value is not None else None
+        key_events = (
+            parse_optional_float(key_events_value) if key_events_value is not None else None
+        )
+        shopline_orders = (
+            parse_int(shopline_orders_value) if shopline_orders_value is not None else None
+        )
+        conversion_value = traffic_row.get("conversion")
+        conversion = parse_optional_float(conversion_value)
+        if conversion is None and visitors and visitors > 0:
+            conversion = round_number((len(day_orders) / visitors * 100))
         rows.append(
             {
                 "date": key,
@@ -1131,6 +1509,11 @@ def build_series(
                 "revenue": round_number(revenue),
                 "orders": len(day_orders),
                 "visitors": visitors,
+                "sessions": sessions,
+                "activeUsers": active_users,
+                "totalUsers": total_users,
+                "keyEvents": key_events,
+                "shoplineOrders": shopline_orders,
                 "conversion": conversion,
             }
         )
@@ -1278,8 +1661,18 @@ def build_profit_summary(
 
 def build_ad_performance(channels: list[dict[str, Any]], ad_spend: dict[str, float]) -> list[dict[str, Any]]:
     rows = []
-    for channel in channels:
-        name = str(channel.get("channel", "")).strip()
+    channel_lookup = {
+        str(channel.get("channel", "")).strip(): channel
+        for channel in channels
+        if str(channel.get("channel", "")).strip()
+    }
+    channel_names = list(channel_lookup)
+    for name in ad_spend:
+        if name not in channel_lookup and float(ad_spend.get(name, 0.0)) > 0:
+            channel_names.append(name)
+
+    for name in channel_names:
+        channel = channel_lookup.get(name, {"channel": name, "orders": 0, "revenue": 0.0})
         spend = float(ad_spend.get(name, 0.0))
         revenue = float(channel.get("revenue", 0.0))
         orders_count = int(channel.get("orders", 0))
@@ -1501,6 +1894,177 @@ def build_alerts(
             }
         )
     return alerts[:5]
+
+
+def build_alerts_v2(
+    kpis: dict[str, float],
+    orders: list[dict[str, Any]],
+    products: list[dict[str, Any]],
+    source_mode: str,
+    errors: list[str],
+    previous_kpis: dict[str, float] | None = None,
+    product_rows: list[dict[str, Any]] | None = None,
+    ad_performance: list[dict[str, Any]] | None = None,
+    order_status: dict[str, Any] | None = None,
+    series: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    previous_kpis = previous_kpis or {}
+    product_rows = product_rows or []
+    ad_performance = ad_performance or []
+    order_status = order_status or {}
+    series = series or []
+    alerts: list[dict[str, Any]] = []
+
+    if source_mode != "live":
+        alerts.append(
+            {
+                "level": "info",
+                "title": "数据源",
+                "message": "当前不是完整实时数据，请先检查 Shopline / GA4 接口配置。",
+            }
+        )
+    if errors:
+        alerts.append(
+            {
+                "level": "critical",
+                "title": "接口异常",
+                "message": "数据接口返回异常，部分指标可能不完整。",
+            }
+        )
+
+    previous_orders = float(previous_kpis.get("orders") or 0)
+    current_orders = float(kpis.get("orders") or 0)
+    order_delta = calculate_delta(current_orders, previous_orders)
+    if len(series) > 1 and previous_orders >= 5 and order_delta is not None and order_delta <= -30:
+        alerts.append(
+            {
+                "level": "warning",
+                "title": "订单下滑",
+                "message": f"当前订单 {int(current_orders)} 单，比上期下降 {abs(round_number(order_delta))}%，建议检查广告投放、流量入口和支付链路。",
+            }
+        )
+
+    low_stock_products = [product for product in products if int(product.get("inventory", 0)) <= 5]
+    if low_stock_products:
+        alerts.append(
+            {
+                "level": "warning",
+                "title": "库存预警",
+                "message": f"{len(low_stock_products)} 个 SKU 库存低于 5 件。",
+            }
+        )
+
+    hot_low_stock = [
+        product
+        for product in product_rows
+        if int(product.get("units", 0)) >= 5 and int(product.get("inventory", 0)) <= 10
+    ]
+    if hot_low_stock:
+        top_hot = sorted(
+            hot_low_stock,
+            key=lambda product: (int(product.get("units", 0)), float(product.get("revenue", 0))),
+            reverse=True,
+        )[:2]
+        names = "、".join(
+            str(product.get("title") or product.get("sku") or "SKU")[:18]
+            for product in top_hot
+        )
+        alerts.append(
+            {
+                "level": "critical",
+                "title": "爆品库存不足",
+                "message": f"{len(hot_low_stock)} 个热卖 SKU 库存低于 10，优先处理：{names}。",
+            }
+        )
+
+    pending_orders = [
+        order
+        for order in orders
+        if str(order.get("fulfillmentStatus", "")).lower() in {"unfulfilled", "pending", "open"}
+    ]
+    if pending_orders:
+        alerts.append(
+            {
+                "level": "warning",
+                "title": "履约队列",
+                "message": f"{len(pending_orders)} 个订单仍处于待发货状态。",
+            }
+        )
+
+    status_counts = order_status.get("counts", {}) if isinstance(order_status, dict) else {}
+    status_rates = order_status.get("rates", {}) if isinstance(order_status, dict) else {}
+    unpaid_count = int(status_counts.get("unpaid") or 0)
+    unpaid_rate = float(status_rates.get("unpaid") or 0)
+    refunded_count = int(status_counts.get("refunded") or 0)
+    refunded_rate = float(status_rates.get("refunded") or 0)
+    if unpaid_count >= 5 and unpaid_rate >= 20:
+        alerts.append(
+            {
+                "level": "warning",
+                "title": "未支付偏高",
+                "message": f"未支付订单 {unpaid_count} 单，占比 {round_number(unpaid_rate)}%，建议检查支付失败、弃单或客服跟进。",
+            }
+        )
+    if refunded_count >= 2 and refunded_rate >= 3:
+        alerts.append(
+            {
+                "level": "critical",
+                "title": "退款异常",
+                "message": f"退款订单 {refunded_count} 单，占比 {round_number(refunded_rate)}%，建议排查商品质量、物流时效和客服记录。",
+            }
+        )
+
+    ad_issues = []
+    for row in ad_performance:
+        channel = str(row.get("channel") or "").strip()
+        spend = float(row.get("spend") or 0)
+        revenue = float(row.get("revenue") or 0)
+        order_count = int(row.get("orders") or 0)
+        roas = float(row.get("roas") or 0)
+        if spend <= 0:
+            continue
+        if order_count == 0:
+            ad_issues.append(f"{channel} 有花费但暂无订单")
+        elif roas < 1.5:
+            ad_issues.append(f"{channel} ROAS {round_number(roas)}")
+        elif revenue < spend:
+            ad_issues.append(f"{channel} 销售额低于广告费")
+    if ad_issues:
+        alerts.append(
+            {
+                "level": "warning",
+                "title": "广告花费异常",
+                "message": "；".join(ad_issues[:2]) + "，建议检查预算、素材和落地页。",
+            }
+        )
+
+    if kpis.get("conversion") is not None and float(kpis.get("conversion") or 0) < 1:
+        alerts.append(
+            {
+                "level": "warning",
+                "title": "转化率偏低",
+                "message": "转化率低于 1%，建议检查落地页、支付链路和流量质量。",
+            }
+        )
+
+    latest_series = series[-1] if series else {}
+    ga4_key_events = parse_optional_float(latest_series.get("keyEvents"))
+    latest_order_count = parse_int(latest_series.get("orders"))
+    if (
+        ga4_key_events is not None
+        and latest_order_count >= 5
+        and ga4_key_events + 1 < latest_order_count
+        and ga4_key_events < latest_order_count * 0.85
+    ):
+        alerts.append(
+            {
+                "level": "info",
+                "title": "GA4 转化延迟",
+                "message": f"GA4 purchase 记录 {round_number(ga4_key_events)} 次，Shopline 今日订单 {latest_order_count} 单，GA4 转化率可能存在延迟。",
+            }
+        )
+
+    return alerts[:8]
 
 
 def build_events(

@@ -7,16 +7,21 @@ from unittest.mock import patch
 
 from shopline_monitor.env_loader import load_environment
 from shopline_monitor.backend import (
+    Ga4TrafficResult,
     ShoplineClient,
     ShoplineConfig,
     build_customer_summary,
     build_dashboard_payload,
     build_channels,
+    build_alerts_v2,
+    build_ad_performance,
     calculate_conversion_rate,
     build_order_query_params,
     build_url,
+    ga4_conversion_rate,
     load_traffic_from_env,
     next_page_info_from_link,
+    normalize_ga4_rate,
     normalize_base_url,
     normalize_endpoint_path,
     normalize_shopline_orders,
@@ -281,6 +286,78 @@ class BackendTests(unittest.TestCase):
         self.assertIsNone(calculate_conversion_rate(orders, [{"date": "2026-06-17", "visitors": None}]))
         self.assertIsNone(calculate_conversion_rate(orders, []))
 
+    def test_ga4_rate_normalization_supports_fraction_and_percent(self):
+        self.assertEqual(normalize_ga4_rate("0.125"), 12.5)
+        self.assertEqual(normalize_ga4_rate("12.5"), 12.5)
+        self.assertIsNone(normalize_ga4_rate(""))
+
+    def test_ga4_conversion_rate_uses_weighted_sessions(self):
+        rows = [
+            {"date": "2026-06-17", "sessions": 100, "conversion": 10},
+            {"date": "2026-06-18", "sessions": 300, "conversion": 20},
+        ]
+
+        self.assertEqual(ga4_conversion_rate(rows), 17.5)
+
+    def test_alerts_include_operational_risks(self):
+        orders = [
+            {
+                "id": "order-1",
+                "createdAt": "2026-06-18",
+                "status": "unpaid",
+                "fulfillmentStatus": "pending",
+            }
+            for _ in range(8)
+        ]
+        kpis = {"orders": 8, "conversion": 0.8}
+        previous_kpis = {"orders": 20}
+        product_rows = [
+            {"title": "Hot SKU", "sku": "hot-1", "units": 12, "revenue": 1200, "inventory": 3}
+        ]
+        ad_performance = [
+            {"channel": "Facebook", "orders": 0, "spend": 500, "revenue": 0, "roas": 0}
+        ]
+        order_status = {
+            "counts": {"unpaid": 8, "refunded": 0},
+            "rates": {"unpaid": 100, "refunded": 0},
+        }
+        series = [
+            {"date": "2026-06-17", "orders": 20, "keyEvents": 18},
+            {"date": "2026-06-18", "orders": 8, "keyEvents": 5},
+        ]
+
+        alerts = build_alerts_v2(
+            kpis,
+            orders,
+            [],
+            "live",
+            [],
+            previous_kpis=previous_kpis,
+            product_rows=product_rows,
+            ad_performance=ad_performance,
+            order_status=order_status,
+            series=series,
+        )
+        titles = {alert["title"] for alert in alerts}
+
+        self.assertIn("订单下滑", titles)
+        self.assertIn("爆品库存不足", titles)
+        self.assertIn("未支付偏高", titles)
+        self.assertIn("广告花费异常", titles)
+        self.assertIn("转化率偏低", titles)
+        self.assertIn("GA4 转化延迟", titles)
+
+    def test_ad_performance_includes_spend_only_channels(self):
+        rows = build_ad_performance(
+            [{"channel": "Facebook", "orders": 2, "revenue": 300}],
+            {"Facebook": 100, "TikTok": 50},
+        )
+        by_channel = {row["channel"]: row for row in rows}
+
+        self.assertEqual(by_channel["Facebook"]["roas"], 3)
+        self.assertEqual(by_channel["TikTok"]["orders"], 0)
+        self.assertEqual(by_channel["TikTok"]["spend"], 50)
+
     def test_build_url_adds_query_params(self):
         url = build_url("https://example.com/api", "/orders", {"limit": "1"})
 
@@ -496,6 +573,123 @@ class BackendTests(unittest.TestCase):
 
         self.assertIsNone(payload["kpis"]["conversion"]["value"])
         self.assertEqual(payload["kpis"]["conversion"]["note"], "未配置真实访客数")
+
+    def test_live_dashboard_prefers_ga4_conversion_rate(self):
+        class FakeClient:
+            config = ShoplineConfig(default_currency="JPY")
+
+            def load_orders(self, days, today=None):
+                return {
+                    "items": [
+                        {
+                            "id": "order-1",
+                            "createdAt": "2026-06-17",
+                            "customer": "Guest",
+                            "source": "Direct",
+                            "market": "JP",
+                            "total": 100,
+                            "currency": "JPY",
+                            "status": "paid",
+                            "fulfillmentStatus": "unfulfilled",
+                            "units": 1,
+                            "items": [],
+                        }
+                    ],
+                    "source": "live",
+                    "error": None,
+                }
+
+            def load_products(self, today=None):
+                return {"items": [], "source": "live", "error": None}
+
+            def connector_status(self):
+                return {"configured": True, "missing": []}
+
+        ga4_current = Ga4TrafficResult(
+            rows=[
+                {
+                    "date": "2026-06-17",
+                    "visitors": None,
+                    "sessions": 200,
+                    "conversion": 12.5,
+                    "source": "ga4",
+                }
+            ],
+            error=None,
+        )
+        ga4_previous = Ga4TrafficResult(
+            rows=[
+                {
+                    "date": "2026-06-16",
+                    "visitors": None,
+                    "sessions": 100,
+                    "conversion": 8.0,
+                    "source": "ga4",
+                }
+            ],
+            error=None,
+        )
+
+        with patch.dict(os.environ, {"GA4_CONVERSION_MODE": "key_event_rate"}, clear=True):
+            with patch(
+                "shopline_monitor.backend.load_ga4_traffic_for_window",
+                side_effect=[ga4_current, ga4_previous],
+            ):
+                payload = build_dashboard_payload("1d", client=FakeClient(), today=date(2026, 6, 17))
+
+        self.assertEqual(payload["kpis"]["conversion"]["value"], 12.5)
+        self.assertEqual(payload["series"][0]["conversion"], 12.5)
+        self.assertEqual(payload["series"][0]["sessions"], 200)
+
+    def test_live_dashboard_defaults_to_ga4_key_event_rate(self):
+        class FakeClient:
+            config = ShoplineConfig(default_currency="JPY")
+
+            def load_orders(self, days, today=None):
+                return {
+                    "items": [
+                        {
+                            "id": "order-1",
+                            "createdAt": today.isoformat(),
+                            "customer": "Guest",
+                            "source": "Direct",
+                            "market": "JP",
+                            "total": 100,
+                            "currency": "JPY",
+                            "status": "paid",
+                            "fulfillmentStatus": "unfulfilled",
+                            "units": 1,
+                            "items": [],
+                        }
+                    ],
+                    "source": "live",
+                    "error": None,
+                }
+
+            def load_products(self, today=None):
+                return {"items": [], "source": "live", "error": None}
+
+            def connector_status(self):
+                return {"configured": True, "missing": []}
+
+        ga4_current = Ga4TrafficResult(
+            rows=[{"date": "2026-06-17", "sessions": 200, "conversion": 12.5, "source": "ga4"}],
+            error=None,
+        )
+        ga4_previous = Ga4TrafficResult(
+            rows=[{"date": "2026-06-16", "sessions": 100, "conversion": 8.0, "source": "ga4"}],
+            error=None,
+        )
+
+        with patch.dict(os.environ, {}, clear=True):
+            with patch(
+                "shopline_monitor.backend.load_ga4_traffic_for_window",
+                side_effect=[ga4_current, ga4_previous],
+            ):
+                payload = build_dashboard_payload("1d", client=FakeClient(), today=date(2026, 6, 17))
+
+        self.assertEqual(payload["kpis"]["conversion"]["value"], 12.5)
+        self.assertEqual(payload["series"][0]["conversion"], 12.5)
 
     def test_dashboard_supports_single_day_query(self):
         class FakeClient:

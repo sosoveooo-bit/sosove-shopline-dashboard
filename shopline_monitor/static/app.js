@@ -25,6 +25,7 @@ document.addEventListener("DOMContentLoaded", () => {
     datePicker.max = localDateString();
   }
   bindControls();
+  initScrollTopButton();
   loadDashboard();
 });
 
@@ -146,6 +147,29 @@ function bindControls() {
   });
 }
 
+function initScrollTopButton() {
+  const button = document.getElementById("scroll-top-btn");
+  if (!button) return;
+
+  const revealAt = 520;
+  const updateVisibility = () => {
+    const shouldShow = window.scrollY > revealAt;
+    button.hidden = false;
+    button.classList.toggle("visible", shouldShow);
+    button.setAttribute("aria-hidden", shouldShow ? "false" : "true");
+    button.tabIndex = shouldShow ? 0 : -1;
+  };
+
+  button.addEventListener("click", () => {
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    window.scrollTo({ top: 0, behavior: reduceMotion ? "auto" : "smooth" });
+  });
+
+  window.addEventListener("scroll", updateVisibility, { passive: true });
+  window.addEventListener("resize", updateVisibility);
+  updateVisibility();
+}
+
 async function loadDashboard() {
   const request = beginRequest();
   try {
@@ -216,6 +240,13 @@ function renderConnector(payload) {
   document.getElementById("connector-orders").textContent = connector.ordersEndpoint || "未配置";
   document.getElementById("connector-products").textContent = connector.productsEndpoint || "未配置";
   document.getElementById("connector-timezone").textContent = connector.timezoneName || "Asia/Tokyo";
+  const ga4 = connector.ga4 || {};
+  document.getElementById("connector-ga4").textContent = ga4.configured
+    ? `已配置 ${ga4.propertyId || "--"}`
+    : "未配置";
+  document.getElementById("connector-ga4-metric").textContent = ga4.configured
+    ? `${ga4.conversionMode || "--"} / ${ga4.metricName || "--"}`
+    : "sessionKeyEventRate";
   const missingNode = document.getElementById("connector-missing");
   missingNode.textContent = connector.missing.length ? `${connector.missing.length} 项未配置` : "无";
   missingNode.title = connector.missing.join(", ");
