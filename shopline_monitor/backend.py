@@ -39,6 +39,7 @@ TRAFFIC_SOURCE_BUCKETS = {
     "Organic",
     "Ad",
 }
+PAID_TRAFFIC_SOURCES = {"Facebook", "Instagram", "Google", "TikTok", "Ad"}
 
 
 @dataclass(frozen=True)
@@ -408,6 +409,7 @@ def build_dashboard_payload(
     ad_spend = load_ad_spend_from_env()
     profit = build_profit_summary(current_orders, channels, cost_config, ad_spend)
     ad_performance = build_ad_performance(channels, ad_spend)
+    campaigns = build_campaign_breakdown(current_orders)
     customers = build_customer_summary(current_orders)
     order_status = build_order_status_summary(current_orders)
     product_rows = build_product_rows(current_orders, products)
@@ -461,6 +463,7 @@ def build_dashboard_payload(
         "channels": channels,
         "profit": profit,
         "adPerformance": ad_performance,
+        "campaigns": campaigns,
         "customers": customers,
         "orderStatus": order_status,
         "products": product_rows,
@@ -692,6 +695,7 @@ def normalize_order(
     ) or current_dashboard_date()
 
     normalized_source, raw_source = extract_order_traffic_source(order)
+    campaign = extract_order_marketing_params(order, raw_source, normalized_source)
 
     return {
         "id": str(
@@ -710,6 +714,7 @@ def normalize_order(
         ),
         "source": normalized_source,
         "sourceRaw": raw_source or normalized_source,
+        "campaign": campaign,
         "market": str(pick(order, "country", "market", "shipping_country", default="Online")),
         "customer": customer_profile["name"],
         "customerId": customer_profile["id"],
@@ -959,6 +964,102 @@ def infer_traffic_source_from_url(url_value: str) -> str:
     if query_sources:
         return query_sources[0]
 
+    return ""
+
+
+def extract_order_marketing_params(
+    order: dict[str, Any],
+    raw_source: str = "",
+    normalized_source: str = "",
+) -> dict[str, str]:
+    query = collect_marketing_query_params(order, raw_source)
+    values = {
+        "channel": normalized_source or normalize_marketing_source(raw_source),
+        "campaignId": first_marketing_value(
+            order,
+            query,
+            "campaign_id",
+            "campaignId",
+            "campaignID",
+            "fb_campaign_id",
+            "utm_id",
+        ),
+        "adsetId": first_marketing_value(
+            order,
+            query,
+            "adset_id",
+            "ad_set_id",
+            "adsetId",
+            "adSetId",
+            "fb_adset_id",
+        ),
+        "adId": first_marketing_value(
+            order,
+            query,
+            "ad_id",
+            "adId",
+            "adID",
+            "fb_ad_id",
+        ),
+        "utmCampaign": first_marketing_value(order, query, "utm_campaign"),
+        "utmContent": first_marketing_value(order, query, "utm_content"),
+        "utmSource": first_marketing_value(order, query, "utm_source"),
+        "utmMedium": first_marketing_value(order, query, "utm_medium"),
+        "utmTerm": first_marketing_value(order, query, "utm_term"),
+    }
+    values["hasCampaignParams"] = "true" if any(
+        values.get(key)
+        for key in ("campaignId", "adsetId", "adId", "utmCampaign", "utmContent")
+    ) else "false"
+    return values
+
+
+def collect_marketing_query_params(order: dict[str, Any], raw_source: str = "") -> dict[str, str]:
+    query: dict[str, str] = {}
+    url_candidates = [
+        raw_source,
+        str(pick(order, "source_url", default="") or ""),
+        str(pick(order, "referring_site", default="") or ""),
+        str(pick(order, "landing_site", default="") or ""),
+        str(pick(order, "source_identifier", default="") or ""),
+    ]
+    for candidate in url_candidates:
+        for key, value in parse_query_values(candidate).items():
+            query.setdefault(key, value)
+    return query
+
+
+def parse_query_values(value: str) -> dict[str, str]:
+    text = str(value or "").strip()
+    if not text:
+        return {}
+
+    parsed = urllib.parse.urlparse(text)
+    raw_query = parsed.query
+    if not raw_query and "=" in text:
+        raw_query = text.split("?", 1)[-1]
+    if not raw_query:
+        return {}
+
+    result: dict[str, str] = {}
+    for key, values in urllib.parse.parse_qs(raw_query, keep_blank_values=False).items():
+        if values:
+            result[str(key).strip()] = str(values[0]).strip()
+    return result
+
+
+def first_marketing_value(
+    order: dict[str, Any],
+    query: dict[str, str],
+    *keys: str,
+) -> str:
+    for key in keys:
+        value = pick(order, key, default="")
+        if value not in (None, ""):
+            return str(value).strip()
+    for key in keys:
+        if key in query and query[key]:
+            return str(query[key]).strip()
     return ""
 
 
@@ -1687,6 +1788,84 @@ def build_ad_performance(channels: list[dict[str, Any]], ad_spend: dict[str, flo
             }
         )
     return rows
+
+
+def build_campaign_breakdown(orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str, str, str, str, str], dict[str, Any]] = {}
+    total_revenue = 0.0
+
+    for order in orders:
+        channel = normalize_marketing_source(order.get("source") or order.get("sourceRaw") or "")
+        campaign = order.get("campaign")
+        if not isinstance(campaign, dict):
+            campaign = extract_order_marketing_params(
+                order,
+                str(order.get("sourceRaw") or ""),
+                channel,
+            )
+
+        has_params = str(campaign.get("hasCampaignParams") or "").lower() == "true"
+        if not has_params and channel not in PAID_TRAFFIC_SOURCES:
+            continue
+
+        campaign_id = str(campaign.get("campaignId") or "").strip()
+        adset_id = str(campaign.get("adsetId") or "").strip()
+        ad_id = str(campaign.get("adId") or "").strip()
+        utm_campaign = str(campaign.get("utmCampaign") or "").strip()
+        utm_content = str(campaign.get("utmContent") or "").strip()
+        key = (
+            channel,
+            campaign_id,
+            adset_id,
+            ad_id,
+            utm_campaign,
+            utm_content,
+        )
+        bucket = grouped.setdefault(
+            key,
+            {
+                "channel": channel,
+                "campaignId": campaign_id,
+                "adsetId": adset_id,
+                "adId": ad_id,
+                "utmCampaign": utm_campaign,
+                "utmContent": utm_content,
+                "utmSource": str(campaign.get("utmSource") or "").strip(),
+                "utmMedium": str(campaign.get("utmMedium") or "").strip(),
+                "orders": 0,
+                "revenue": 0.0,
+                "units": 0,
+            },
+        )
+        revenue = float(order.get("total", 0))
+        bucket["orders"] += 1
+        bucket["revenue"] += revenue
+        bucket["units"] += int(order.get("units", 0))
+        total_revenue += revenue
+
+    rows = []
+    total_revenue = total_revenue or 1.0
+    for bucket in grouped.values():
+        orders_count = int(bucket["orders"])
+        revenue = float(bucket["revenue"])
+        rows.append(
+            {
+                "channel": bucket["channel"],
+                "campaignId": bucket["campaignId"],
+                "adsetId": bucket["adsetId"],
+                "adId": bucket["adId"],
+                "utmCampaign": bucket["utmCampaign"],
+                "utmContent": bucket["utmContent"],
+                "utmSource": bucket["utmSource"],
+                "utmMedium": bucket["utmMedium"],
+                "orders": orders_count,
+                "revenue": round_number(revenue),
+                "aov": round_number(revenue / orders_count if orders_count else 0),
+                "units": int(bucket["units"]),
+                "share": round_number(revenue / total_revenue * 100),
+            }
+        )
+    return sorted(rows, key=lambda row: (row["revenue"], row["orders"]), reverse=True)[:12]
 
 
 def build_customer_summary(orders: list[dict[str, Any]]) -> dict[str, Any]:

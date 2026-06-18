@@ -13,6 +13,7 @@ from shopline_monitor.backend import (
     build_customer_summary,
     build_dashboard_payload,
     build_channels,
+    build_campaign_breakdown,
     build_alerts_v2,
     build_ad_performance,
     calculate_conversion_rate,
@@ -107,6 +108,34 @@ class BackendTests(unittest.TestCase):
 
         self.assertEqual(orders[0]["source"], "Facebook")
         self.assertIn("fbclid=test-click", orders[0]["sourceRaw"])
+
+    def test_normalize_orders_extracts_campaign_tracking_params(self):
+        payload = {
+            "orders": [
+                {
+                    "order_id": "fb-campaign-1",
+                    "total_price": "100",
+                    "source_name": "Shopline",
+                    "source_url": (
+                        "https://sosove.com/products/a?"
+                        "utm_source=ad&utm_medium=facebook&utm_campaign=636069"
+                        "&utm_content=120249974748790653"
+                        "&campaign_id=120249974748790653"
+                        "&adset_id=120250123546760653"
+                        "&ad_id=120250123560130653"
+                    ),
+                }
+            ]
+        }
+
+        orders = normalize_shopline_orders(payload)
+
+        self.assertEqual(orders[0]["source"], "Facebook")
+        self.assertEqual(orders[0]["campaign"]["campaignId"], "120249974748790653")
+        self.assertEqual(orders[0]["campaign"]["adsetId"], "120250123546760653")
+        self.assertEqual(orders[0]["campaign"]["adId"], "120250123560130653")
+        self.assertEqual(orders[0]["campaign"]["utmCampaign"], "636069")
+        self.assertEqual(orders[0]["campaign"]["utmContent"], "120249974748790653")
 
     def test_normalize_orders_extracts_customer_profile_fields(self):
         payload = {
@@ -207,6 +236,52 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(grouped["Organic"]["orders"], 1)
         self.assertEqual(grouped["Direct"]["orders"], 1)
         self.assertEqual(grouped["Ad"]["orders"], 1)
+
+    def test_build_campaign_breakdown_groups_ad_tracking_rows(self):
+        orders = [
+            {
+                "source": "Facebook",
+                "sourceRaw": "https://sosove.com?a=1",
+                "total": 100,
+                "units": 2,
+                "campaign": {
+                    "channel": "Facebook",
+                    "campaignId": "camp-1",
+                    "adsetId": "set-1",
+                    "adId": "ad-1",
+                    "utmCampaign": "launch",
+                    "utmContent": "creative-a",
+                    "hasCampaignParams": "true",
+                },
+            },
+            {
+                "source": "Facebook",
+                "sourceRaw": "https://sosove.com?a=2",
+                "total": 80,
+                "units": 1,
+                "campaign": {
+                    "channel": "Facebook",
+                    "campaignId": "camp-1",
+                    "adsetId": "set-1",
+                    "adId": "ad-1",
+                    "utmCampaign": "launch",
+                    "utmContent": "creative-a",
+                    "hasCampaignParams": "true",
+                },
+            },
+            {"source": "Direct", "sourceRaw": "Direct", "total": 50, "units": 1},
+        ]
+
+        rows = build_campaign_breakdown(orders)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["channel"], "Facebook")
+        self.assertEqual(rows[0]["campaignId"], "camp-1")
+        self.assertEqual(rows[0]["adsetId"], "set-1")
+        self.assertEqual(rows[0]["adId"], "ad-1")
+        self.assertEqual(rows[0]["orders"], 2)
+        self.assertEqual(rows[0]["revenue"], 180)
+        self.assertEqual(rows[0]["aov"], 90)
 
     def test_normalize_products_reads_variant_fallbacks(self):
         payload = {
