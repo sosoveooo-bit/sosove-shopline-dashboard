@@ -3,32 +3,45 @@ import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from shopline_monitor.env_loader import load_environment
 from shopline_monitor.backend import (
+    CostConfig,
+    Ga4Config,
     Ga4TrafficResult,
     ShoplineClient,
     ShoplineConfig,
     build_customer_summary,
+    build_data_reconciliation,
     build_dashboard_payload,
+    build_ga4_status,
+    build_campaign_breakdown,
     build_channels,
     build_alerts_v2,
     build_ad_performance,
+    build_attribution_diagnostics,
+    build_daily_operating_summary,
     calculate_conversion_rate,
     build_order_query_params,
     build_url,
     ga4_conversion_rate,
     load_traffic_from_env,
+    merge_ga4_channel_session_starts,
     next_page_info_from_link,
     normalize_ga4_rate,
+    normalize_ga4_channel_rows,
     normalize_base_url,
     normalize_endpoint_path,
     normalize_shopline_orders,
     normalize_shopline_products,
     normalize_marketing_source,
+    probe_ga4_connection,
+    apply_dashboard_filters,
+    deduplicate_orders,
 )
-from shopline_monitor.server import parse_date_param
+from shopline_monitor.server import dashboard_auth_enabled, parse_date_param, verify_dashboard_token
 
 
 class BackendTests(unittest.TestCase):
@@ -107,6 +120,175 @@ class BackendTests(unittest.TestCase):
 
         self.assertEqual(orders[0]["source"], "Facebook")
         self.assertIn("fbclid=test-click", orders[0]["sourceRaw"])
+
+    def test_normalize_orders_reads_shopline_utm_json_and_landing_query(self):
+        payload = {
+            "orders": [
+                {
+                    "order_id": "nested-utm",
+                    "landing_site": "https://sosove.com/products/a",
+                    "utm_parameters": '{"utm_source":"ad","utm_medium":"facebook","utm_campaign":"launch-1","utm_content":"video-01","utm_term":"summer-dress"}',
+                },
+                {
+                    "order_id": "line-order",
+                    "source_url": "https://access.line.me/profile",
+                    "landing_site": "https://sosove.com/products/b?utm_source=line&utm_medium=chat",
+                },
+                {
+                    "order_id": "direct-order",
+                    "landing_site": "https://sosove.com/products/c",
+                },
+            ]
+        }
+
+        orders = normalize_shopline_orders(payload)
+
+        self.assertEqual([row["source"] for row in orders], ["Facebook", "LINE", "Direct"])
+        self.assertEqual(orders[0]["sourceUtm"], "ad")
+        self.assertEqual(orders[0]["sourceMedium"], "facebook")
+        self.assertEqual(orders[0]["sourceCampaign"], "launch-1")
+        self.assertEqual(orders[0]["sourceContent"], "video-01")
+        self.assertEqual(orders[0]["sourceTerm"], "summer-dress")
+        self.assertEqual(orders[0]["attributionMethod"], "utm")
+        self.assertEqual(orders[0]["attributionConfidence"], "high")
+
+    def test_ga4_channels_merge_sessions_with_shopline_orders(self):
+        response = SimpleNamespace(
+            dimension_headers=[
+                SimpleNamespace(name="sessionSource"),
+                SimpleNamespace(name="sessionMedium"),
+                SimpleNamespace(name="sessionDefaultChannelGroup"),
+            ],
+            metric_headers=[
+                SimpleNamespace(name="sessions"),
+                SimpleNamespace(name="activeUsers"),
+                SimpleNamespace(name="keyEvents:purchase"),
+            ],
+            rows=[
+                SimpleNamespace(
+                    dimension_values=[
+                        SimpleNamespace(value="ad"),
+                        SimpleNamespace(value="facebook"),
+                        SimpleNamespace(value="Unassigned"),
+                    ],
+                    metric_values=[
+                        SimpleNamespace(value="100"),
+                        SimpleNamespace(value="80"),
+                        SimpleNamespace(value="4"),
+                    ],
+                ),
+                SimpleNamespace(
+                    dimension_values=[
+                        SimpleNamespace(value="line"),
+                        SimpleNamespace(value="chat"),
+                        SimpleNamespace(value="Organic Social"),
+                    ],
+                    metric_values=[
+                        SimpleNamespace(value="20"),
+                        SimpleNamespace(value="16"),
+                        SimpleNamespace(value="1"),
+                    ],
+                ),
+            ],
+        )
+        ga4_rows = normalize_ga4_channel_rows(response)
+
+        channels = build_channels(
+            [{"source": "Facebook", "total": 250, "units": 2}],
+            ga4_rows,
+        )
+        grouped = {row["channel"]: row for row in channels}
+
+        self.assertEqual(grouped["Facebook"]["sessions"], 100)
+        self.assertEqual(grouped["Facebook"]["orders"], 1)
+        self.assertEqual(grouped["Facebook"]["conversion"], 4)
+        self.assertEqual(grouped["LINE"]["sessions"], 20)
+        self.assertEqual(grouped["LINE"]["orders"], 0)
+
+    def test_ga4_status_exposes_live_purchase_diagnostics(self):
+        status = build_ga4_status(
+            Ga4Config(property_id="123", service_account_json="{}"),
+            [
+                {
+                    "date": "2026-06-17",
+                    "sessions": 200,
+                    "activeUsers": 150,
+                    "keyEvents": 8,
+                    "conversion": 4,
+                }
+            ],
+            [{"channel": "Facebook", "sessions": 100}],
+            start=date(2026, 6, 17),
+            end=date(2026, 6, 17),
+        )
+
+        self.assertEqual(status["status"], "ready")
+        self.assertEqual(status["purchases"], 8)
+        self.assertEqual(status["sessions"], 200)
+        self.assertEqual(status["channelRows"], 1)
+
+    def test_ga4_channel_sessions_use_additive_session_start_counts(self):
+        rows = merge_ga4_channel_session_starts(
+            [
+                {
+                    "channel": "Facebook",
+                    "source": "facebook",
+                    "medium": "paid_social",
+                    "group": "Paid Social",
+                    "sessions": 140,
+                    "activeUsers": 110,
+                    "keyEvents": 6,
+                    "adCost": 50,
+                }
+            ],
+            [
+                {
+                    "source": "facebook",
+                    "medium": "paid_social",
+                    "group": "Paid Social",
+                    "sessions": 100,
+                    "activeUsers": 80,
+                }
+            ],
+        )
+
+        self.assertEqual(rows[0]["sessions"], 100)
+        self.assertEqual(rows[0]["activeUsers"], 80)
+        self.assertEqual(rows[0]["reportedSessions"], 140)
+        self.assertEqual(rows[0]["keyEvents"], 6)
+        self.assertEqual(rows[0]["adCost"], 50)
+
+    def test_reconciliation_surfaces_ga4_query_error_instead_of_generic_missing(self):
+        status = {"status": "error", "label": "GA4 接口异常"}
+
+        reconciliation = build_data_reconciliation([{"id": "order-1"}], [], status)
+
+        self.assertEqual(reconciliation["status"], "error")
+        self.assertEqual(reconciliation["label"], "GA4 接口异常")
+
+    def test_ga4_probe_returns_purchase_and_conversion(self):
+        rows = [
+            {
+                "date": "2026-06-17",
+                "sessions": 200,
+                "activeUsers": 150,
+                "keyEvents": 6,
+                "conversion": 3.25,
+            }
+        ]
+        env = {
+            "GA4_PROPERTY_ID": "123",
+            "GA4_SERVICE_ACCOUNT_JSON": "{}",
+            "GA4_CONVERSION_MODE": "key_event_rate",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            with patch("shopline_monitor.backend.fetch_ga4_traffic_series", return_value=rows):
+                result = probe_ga4_connection(date(2026, 6, 17))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["purchases"], 6)
+        self.assertEqual(result["sessions"], 200)
+        self.assertEqual(result["conversion"], 3.25)
 
     def test_normalize_orders_extracts_customer_profile_fields(self):
         payload = {
@@ -208,6 +390,41 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(grouped["Direct"]["orders"], 1)
         self.assertEqual(grouped["Ad"]["orders"], 1)
 
+    def test_build_channels_exposes_utm_breakdown(self):
+        channels = build_channels(
+            [
+                {
+                    "source": "Facebook",
+                    "sourceUtm": "facebook",
+                    "sourceMedium": "cpc",
+                    "sourceCampaign": "summer-sale",
+                    "sourceContent": "video-01",
+                    "sourceTerm": "dress",
+                    "total": 120,
+                    "units": 1,
+                },
+                {
+                    "source": "Facebook",
+                    "sourceUtm": "facebook",
+                    "sourceMedium": "cpc",
+                    "sourceCampaign": "summer-sale",
+                    "sourceContent": "video-01",
+                    "sourceTerm": "dress",
+                    "total": 80,
+                    "units": 1,
+                },
+                {"source": "Facebook", "total": 50, "units": 1},
+            ]
+        )
+
+        facebook = channels[0]
+        self.assertEqual(facebook["utmCombinationCount"], 1)
+        self.assertEqual(facebook["utmOrders"], 2)
+        self.assertEqual(facebook["utmCoverage"], 66.67)
+        self.assertEqual(facebook["utmDetails"][0]["campaign"], "summer-sale")
+        self.assertEqual(facebook["utmDetails"][0]["orders"], 2)
+        self.assertEqual(facebook["utmDetails"][0]["revenue"], 200)
+
     def test_normalize_products_reads_variant_fallbacks(self):
         payload = {
             "products": [
@@ -259,6 +476,21 @@ class BackendTests(unittest.TestCase):
                 self.assertEqual(os.environ["SHOPLINE_TIMEZONE"], "Asia/Tokyo")
                 self.assertEqual(os.environ["SHOPLINE_AD_SPEND_JSON"], '{"Facebook":100}')
                 self.assertNotIn("SHOPLINE_API_BASE_URL", loaded)
+
+    def test_load_environment_strips_utf8_bom_from_first_key(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "SHOPLINE_API_BASE_URL=https://example.com\nSHOPLINE_ACCESS_TOKEN=test-token\n",
+                encoding="utf-8-sig",
+            )
+
+            with patch.dict(os.environ, {}, clear=True):
+                loaded = load_environment([env_path])
+
+                self.assertEqual(os.environ["SHOPLINE_API_BASE_URL"], "https://example.com")
+                self.assertEqual(os.environ["SHOPLINE_ACCESS_TOKEN"], "test-token")
+                self.assertIn("SHOPLINE_API_BASE_URL", loaded)
 
     def test_traffic_env_drives_conversion_rate(self):
         env = {
@@ -532,7 +764,8 @@ class BackendTests(unittest.TestCase):
                 return {"configured": True, "missing": []}
 
         client = FakeClient()
-        payload = build_dashboard_payload("7d", client=client, today=date(2026, 6, 17))
+        with patch.dict(os.environ, {"GA4_PROPERTY_ID": ""}):
+            payload = build_dashboard_payload("7d", client=client, today=date(2026, 6, 17))
 
         self.assertEqual(
             client.order_calls,
@@ -641,7 +874,7 @@ class BackendTests(unittest.TestCase):
         with patch.dict(os.environ, {"GA4_CONVERSION_MODE": "key_event_rate"}, clear=True):
             with patch(
                 "shopline_monitor.backend.load_ga4_traffic_for_window",
-                side_effect=[ga4_current, ga4_current, ga4_previous, ga4_empty],
+                side_effect=[ga4_current, ga4_previous, ga4_empty],
             ):
                 payload = build_dashboard_payload("1d", client=FakeClient(), today=date(2026, 6, 17))
 
@@ -696,7 +929,7 @@ class BackendTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             with patch(
                 "shopline_monitor.backend.load_ga4_traffic_for_window",
-                side_effect=[ga4_current, ga4_current, ga4_previous, ga4_empty],
+                side_effect=[ga4_current, ga4_previous, ga4_empty],
             ):
                 payload = build_dashboard_payload("1d", client=FakeClient(), today=date(2026, 6, 17))
 
@@ -740,7 +973,8 @@ class BackendTests(unittest.TestCase):
                 return {"configured": True, "missing": []}
 
         client = FakeClient()
-        payload = build_dashboard_payload("1d", client=client, today=date(2026, 6, 17))
+        with patch.dict(os.environ, {"GA4_PROPERTY_ID": ""}):
+            payload = build_dashboard_payload("1d", client=client, today=date(2026, 6, 17))
 
         self.assertEqual(payload["range"]["days"], 1)
         self.assertEqual(len(payload["series"]), 1)
@@ -805,11 +1039,187 @@ class BackendTests(unittest.TestCase):
             def connector_status(self):
                 return {"configured": True, "missing": []}
 
-        payload = build_dashboard_payload("7d", client=FakeClient(), today=date(2026, 6, 17))
+        with patch.dict(os.environ, {"GA4_PROPERTY_ID": ""}):
+            payload = build_dashboard_payload("7d", client=FakeClient(), today=date(2026, 6, 17))
 
         self.assertEqual(payload["kpis"]["orders"]["value"], 14)
         self.assertEqual(len(payload["orders"]), 12)
         self.assertTrue(all(order["createdAt"] == "2026-06-17" for order in payload["orders"]))
+
+    def test_global_filters_apply_channel_market_status_and_product(self):
+        orders = [
+            {
+                "source": "Facebook",
+                "market": "JP",
+                "status": "paid",
+                "fulfillmentStatus": "unfulfilled",
+                "items": [{"sku": "SKU-1", "title": "Dress"}],
+            },
+            {
+                "source": "Google",
+                "market": "US",
+                "status": "unpaid",
+                "fulfillmentStatus": "pending",
+                "items": [{"sku": "SKU-2", "title": "Coat"}],
+            },
+        ]
+
+        filtered = apply_dashboard_filters(
+            orders,
+            {"channel": "Facebook", "market": "JP", "status": "paid", "product": "SKU-1"},
+        )
+
+        self.assertEqual(filtered, [orders[0]])
+
+    def test_campaign_breakdown_tracks_campaign_adset_and_ad(self):
+        rows = build_campaign_breakdown(
+            [
+                {
+                    "source": "Facebook",
+                    "sourceCampaign": "C-1",
+                    "sourceAdset": "AS-1",
+                    "sourceAd": "AD-1",
+                    "customerKey": "customer-1",
+                    "total": 120,
+                },
+                {
+                    "source": "Facebook",
+                    "sourceCampaign": "C-1",
+                    "sourceAdset": "AS-1",
+                    "sourceAd": "AD-1",
+                    "customerKey": "customer-2",
+                    "total": 80,
+                },
+            ]
+        )
+
+        self.assertEqual(rows["coverage"], 100)
+        self.assertEqual(rows["rows"][0]["orders"], 2)
+        self.assertEqual(rows["rows"][0]["customers"], 2)
+        self.assertEqual(rows["rows"][0]["revenue"], 200)
+
+    def test_attribution_diagnostics_finds_missing_invalid_and_click_mapping(self):
+        orders = [
+            {
+                "id": "bad-1",
+                "createdAt": "2026-06-17",
+                "customer": "Mia",
+                "source": "Facebook",
+                "sourceUtm": "FB",
+                "sourceMedium": "Paid Social",
+                "sourceCampaign": "",
+                "sourceCampaignId": "",
+                "clickIds": {"fbclid": "click-123456789"},
+                "total": 120,
+            },
+            {
+                "id": "good-1",
+                "createdAt": "2026-06-17",
+                "customer": "Yuki",
+                "source": "Google",
+                "sourceUtm": "google",
+                "sourceMedium": "cpc",
+                "sourceCampaign": "summer-sale",
+                "sourceCampaignId": "g-campaign",
+                "clickIds": {},
+                "total": 90,
+            },
+            {
+                "id": "direct-1",
+                "createdAt": "2026-06-17",
+                "customer": "Guest",
+                "source": "Direct",
+                "sourceUtm": "",
+                "sourceMedium": "",
+                "sourceCampaign": "",
+                "sourceCampaignId": "",
+                "clickIds": {},
+                "total": 50,
+            },
+        ]
+        mapping = '{"fbclid:click-123456789":{"campaignId":"meta-42","campaignName":"summer-meta"}}'
+
+        with patch.dict(os.environ, {"SHOPLINE_CLICK_CAMPAIGN_MAP_JSON": mapping}):
+            result = build_attribution_diagnostics(orders)
+
+        self.assertEqual(result["summary"]["totalOrders"], 3)
+        self.assertEqual(result["summary"]["completeUtmOrders"], 1)
+        self.assertEqual(result["summary"]["missingOrders"], 2)
+        self.assertEqual(result["summary"]["mappedClickOrders"], 1)
+        self.assertGreaterEqual(result["summary"]["invalidOrders"], 1)
+        self.assertTrue(any(row["code"] == "source_alias" for row in result["issues"]))
+        self.assertEqual(result["clickMappings"][0]["campaignId"], "meta-42")
+
+    def test_daily_operating_summary_exposes_channel_movement_profit_and_product_anomaly(self):
+        orders = [
+            {
+                "id": "today-1",
+                "createdAt": "2026-06-17",
+                "source": "Facebook",
+                "total": 300,
+                "refundTotal": 0,
+                "discounts": 0,
+                "taxTotal": 0,
+                "market": "JP",
+                "items": [{"title": "Dress", "sku": "D-1", "quantity": 4, "revenue": 300}],
+            },
+            {
+                "id": "yesterday-1",
+                "createdAt": "2026-06-16",
+                "source": "Google",
+                "total": 120,
+                "refundTotal": 0,
+                "discounts": 0,
+                "taxTotal": 0,
+                "market": "JP",
+                "items": [{"title": "Coat", "sku": "C-1", "quantity": 1, "revenue": 120}],
+            },
+        ]
+        products = [{"title": "Dress", "sku": "D-1", "inventory": 5}]
+
+        summary = build_daily_operating_summary(
+            date(2026, 6, 17),
+            orders,
+            products,
+            CostConfig(product_cost_rate=0.35, payment_fee_rate=0.036, shipping_cost_per_order=10),
+            {},
+        )
+
+        self.assertEqual(summary["metrics"]["orders"], 1)
+        self.assertEqual(summary["growthChannels"][0]["channel"], "Facebook")
+        self.assertEqual(summary["declineChannels"][0]["channel"], "Google")
+        self.assertEqual(summary["abnormalProducts"][0]["type"], "stock")
+        self.assertGreater(summary["metrics"]["estimatedProfit"], 0)
+
+    def test_alerts_are_decorated_with_action_metadata(self):
+        alerts = build_alerts_v2(
+            {"orders": 0, "conversion": 0.2},
+            [],
+            [],
+            "sample",
+            [],
+        )
+
+        self.assertTrue(alerts)
+        self.assertTrue(alerts[0]["id"])
+        self.assertEqual(alerts[0]["actions"], ["orders", "channels", "dismiss", "notify"])
+
+    def test_order_deduplication_keeps_first_order(self):
+        unique, duplicates = deduplicate_orders(
+            [{"id": "1", "total": 100}, {"id": "1", "total": 120}, {"id": "2", "total": 90}]
+        )
+
+        self.assertEqual([row["id"] for row in unique], ["1", "2"])
+        self.assertEqual(duplicates, 1)
+
+    def test_optional_dashboard_authentication(self):
+        with patch.dict(os.environ, {"DASHBOARD_ACCESS_TOKEN": "secret-token"}):
+            self.assertTrue(dashboard_auth_enabled())
+            self.assertTrue(verify_dashboard_token("secret-token"))
+            self.assertFalse(verify_dashboard_token("wrong"))
+        with patch.dict(os.environ, {"DASHBOARD_ACCESS_TOKEN": ""}):
+            self.assertFalse(dashboard_auth_enabled())
+            self.assertTrue(verify_dashboard_token(""))
 
     def test_parse_date_param_accepts_iso_date(self):
         self.assertEqual(parse_date_param("2026-06-17"), date(2026, 6, 17))

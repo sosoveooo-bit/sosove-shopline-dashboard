@@ -28,6 +28,9 @@
         </div>
         <nav class="nav-links">
           <a class="active" href="#overview">总览</a>
+          <a href="#daily-summary">今日摘要</a>
+          <a href="#data-quality">数据质量</a>
+          <a href="#attribution-diagnostics">广告归因</a>
           <a href="#orders">订单</a>
           <a href="#products">商品</a>
           <a href="#connector">接口</a>
@@ -54,7 +57,9 @@
               <b>ORDER RADAR</b>
             </div>
           </div>
-          <div class="toolbar" aria-label="看板操作">
+          <details class="toolbar-disclosure" id="toolbar-disclosure" open>
+            <summary><span>日期、同步与设置</span><b id="mobile-range-caption">展开</b></summary>
+            <div class="toolbar" aria-label="看板操作">
             <div class="segmented" role="group" aria-label="时间范围">
               <button type="button" data-range="7d" class="active">7 天</button>
               <button type="button" data-range="30d">30 天</button>
@@ -78,14 +83,15 @@
               <span>自动刷新</span>
               <select id="auto-refresh-select" aria-label="自动刷新频率">
                 <option value="0">关闭</option>
-                <option value="300000">5 分钟</option>
+                <option value="300000" selected>5 分钟（推荐）</option>
                 <option value="600000">10 分钟</option>
                 <option value="1800000">30 分钟</option>
               </select>
             </label>
             <button type="button" class="button ghost" id="test-connector-btn">接口测试</button>
-            <button type="button" class="button primary" id="sync-btn"><span aria-hidden="true">⟳</span>同步</button>
-          </div>
+              <button type="button" class="button primary" id="sync-btn"><span aria-hidden="true">⟳</span>同步</button>
+            </div>
+          </details>
         </header>
 
         <section class="status-rail" aria-label="数据状态">
@@ -108,6 +114,28 @@
         </section>
 
         <section class="notice critical" id="error-panel" hidden></section>
+
+        <section class="filter-command" aria-label="全局筛选器">
+          <div class="filter-command-title">
+            <span>GLOBAL SCOPE</span>
+            <strong>全局经营筛选</strong>
+          </div>
+          <label><span>渠道</span><select id="global-channel-filter"><option value="">全部渠道</option></select></label>
+          <label><span>状态</span><select id="global-status-filter"><option value="">全部状态</option></select></label>
+          <label><span>市场</span><select id="global-market-filter"><option value="">全部市场</option></select></label>
+          <label><span>商品</span><select id="global-product-filter"><option value="">全部商品</option></select></label>
+          <div class="filter-actions">
+            <button type="button" class="button primary compact" id="filter-apply-btn">应用</button>
+            <button type="button" class="button ghost compact" id="filter-reset-btn">重置</button>
+            <button type="button" class="button ghost compact" id="report-export-btn">经营报表</button>
+          </div>
+        </section>
+
+        <section class="load-progress" id="load-progress" hidden aria-live="polite">
+          <span class="load-progress-orb"></span>
+          <div><strong>正在同步经营数据</strong><small>Shopline、GA4 与归因模型并行加载</small></div>
+          <i></i>
+        </section>
 
         <section class="kpi-grid" aria-label="核心指标">
           <article class="metric-card revenue" data-kpi="revenue">
@@ -154,6 +182,88 @@
           </article>
         </section>
 
+        <nav class="mobile-quick-nav" aria-label="手机端快捷导航">
+          <a href="#daily-summary">经营摘要</a>
+          <a href="#channels">渠道</a>
+          <a href="#attribution-diagnostics">归因</a>
+          <a href="#orders">订单</a>
+          <a href="#overview">设置</a>
+        </nav>
+
+        <section class="panel operating-brief" id="daily-summary">
+          <div class="panel-header">
+            <div><p>Daily command brief</p><h2>今日经营摘要</h2></div>
+            <span class="panel-badge" id="daily-summary-date">--</span>
+          </div>
+          <p class="brief-headline" id="daily-summary-headline">正在生成今日经营判断…</p>
+          <div class="brief-metrics">
+            <div><span>今日订单</span><strong id="daily-orders">--</strong><small id="daily-orders-delta">--</small></div>
+            <div><span>今日销售额</span><strong id="daily-revenue">--</strong><small id="daily-revenue-delta">--</small></div>
+            <div><span>预计利润</span><strong id="daily-profit">--</strong><small id="daily-profit-margin">--</small></div>
+            <div><span>异常商品</span><strong id="daily-anomaly-count">--</strong><small>销量 / 库存监测</small></div>
+          </div>
+          <div class="brief-lanes">
+            <article class="brief-lane growth"><div><span>UP</span><h3>增长渠道</h3></div><ol id="daily-growth-channels"></ol></article>
+            <article class="brief-lane decline"><div><span>DOWN</span><h3>下降渠道</h3></div><ol id="daily-decline-channels"></ol></article>
+            <article class="brief-lane anomaly"><div><span>WATCH</span><h3>异常商品</h3></div><ol id="daily-product-anomalies"></ol></article>
+          </div>
+        </section>
+
+        <section class="trust-grid" id="data-quality">
+          <article class="panel trust-panel">
+            <div class="panel-header"><div><p>Reconciliation</p><h2>数据对账中心</h2></div><span class="status-pill" id="reconcile-status">--</span></div>
+            <div class="reconcile-visual">
+              <div><span>Shopline 订单</span><strong id="reconcile-shopline">--</strong></div>
+              <b>⇄</b>
+              <div><span>GA4 Purchase</span><strong id="reconcile-ga4">--</strong></div>
+            </div>
+            <p class="panel-note" id="reconcile-note">--</p>
+          </article>
+          <article class="panel trust-panel">
+            <div class="panel-header"><div><p>Data trust</p><h2>同步质量</h2></div><span class="quality-grade" id="quality-grade">--</span></div>
+            <div class="quality-meter"><i id="quality-meter"></i></div>
+            <div class="quality-facts" id="quality-facts"></div>
+          </article>
+          <article class="panel trust-panel">
+            <div class="panel-header"><div><p>Attribution health</p><h2>归因覆盖</h2></div><span class="panel-badge" id="campaign-coverage">--</span></div>
+            <div class="quality-facts" id="attribution-facts"></div>
+            <p class="panel-note">对缺少 UTM、广告组和素材编号的订单持续诊断。</p>
+          </article>
+        </section>
+
+        <section class="panel attribution-diagnostics" id="attribution-diagnostics">
+          <div class="panel-header attribution-header">
+            <div><p>Attribution debugger</p><h2>归因覆盖诊断台</h2></div>
+            <div class="attribution-badges">
+              <span class="panel-badge" id="utm-coverage-badge">UTM --</span>
+              <span class="status-pill" id="click-map-badge">Click ID --</span>
+            </div>
+          </div>
+          <div class="diagnostic-metrics" id="diagnostic-metrics"></div>
+          <details class="rules-disclosure">
+            <summary><span>UTM 命名规范</span><small>查看规则与自动修正逻辑</small></summary>
+            <ul id="utm-rules"></ul>
+          </details>
+          <div class="diagnostic-tabs" role="tablist" aria-label="归因诊断分类">
+            <button type="button" class="active" data-diagnostic-tab="missing">UTM 缺失 <b id="missing-utm-count">0</b></button>
+            <button type="button" data-diagnostic-tab="issues">错误 UTM <b id="utm-issue-count">0</b></button>
+            <button type="button" data-diagnostic-tab="clicks">Click ID 映射 <b id="click-map-count">0</b></button>
+          </div>
+          <div class="diagnostic-pane active" data-diagnostic-pane="missing">
+            <div class="table-wrap"><table id="missing-utm-table"><tbody id="missing-utm-rows"></tbody></table></div>
+          </div>
+          <div class="diagnostic-pane" data-diagnostic-pane="issues" hidden>
+            <div class="table-wrap"><table id="utm-issue-table"><tbody id="utm-issue-rows"></tbody></table></div>
+          </div>
+          <div class="diagnostic-pane" data-diagnostic-pane="clicks" hidden>
+            <div class="mapping-command">
+              <p>将未映射项写入 <code>SHOPLINE_CLICK_CAMPAIGN_MAP_JSON</code>，即可补齐 Campaign ID。</p>
+              <button type="button" class="button ghost compact" id="copy-click-map-btn">复制映射模板</button>
+            </div>
+            <div class="table-wrap"><table id="click-map-table"><tbody id="click-map-rows"></tbody></table></div>
+          </div>
+        </section>
+
         <section class="layout-grid">
           <article class="panel wide">
             <div class="panel-header">
@@ -177,15 +287,15 @@
             </div>
           </article>
 
-          <article class="panel" id="connector">
-            <div class="panel-header">
+          <details class="panel disclosure-panel" id="connector">
+            <summary class="panel-summary">
               <div>
                 <p>Connector</p>
                 <h2>Shopline 接口</h2>
               </div>
-              <span class="status-pill" id="connector-pill">--</span>
-            </div>
-            <dl class="connector-list">
+              <span class="summary-status"><b class="status-pill" id="connector-pill">--</b><i aria-hidden="true"></i></span>
+            </summary>
+            <div class="disclosure-content"><dl class="connector-list">
               <div>
                 <dt>API Base</dt>
                 <dd id="connector-base">--</dd>
@@ -214,26 +324,53 @@
                 <dt>缺少配置</dt>
                 <dd id="connector-missing">--</dd>
               </div>
-            </dl>
-          </article>
+            </dl></div>
+          </details>
+        </section>
+
+        <section class="panel campaign-panel collapsed" id="campaigns">
+          <div class="panel-header">
+            <div><p>Campaign intelligence</p><h2>渠道广告下钻</h2></div>
+            <div class="panel-actions campaign-actions">
+              <span class="campaign-fold-summary" id="campaign-fold-summary">--</span>
+              <input type="search" id="campaign-search" placeholder="搜索 Campaign / Adset / Ad">
+              <button type="button" class="button ghost compact" id="campaign-export-btn">导出</button>
+              <button type="button" class="button ghost compact campaign-toggle" id="campaign-toggle-btn" aria-expanded="false" aria-controls="campaign-table-wrap">展开详情</button>
+            </div>
+          </div>
+          <div class="table-wrap campaign-table-wrap" id="campaign-table-wrap">
+            <table class="campaign-table" id="campaign-table">
+              <thead><tr><th>渠道</th><th>Campaign</th><th>Adset</th><th>Ad / Content</th><th>订单</th><th>客户</th><th>销售额</th><th>客单价</th></tr></thead>
+              <tbody id="campaign-rows"></tbody>
+            </table>
+          </div>
         </section>
 
         <section class="layout-grid">
-          <article class="panel">
+          <article class="panel" id="channels">
             <div class="panel-header">
               <div>
-                <p>Channels</p>
+                <p>Channels · Full attribution</p>
                 <h2>流量来源</h2>
               </div>
+              <span class="panel-badge" id="channel-mode">--</span>
+            </div>
+            <div class="channel-insights" id="channel-insights" aria-label="渠道归因概览">
+              <div><span>GA4 渠道会话</span><strong id="channel-sessions">--</strong></div>
+              <div><span>流量识别率</span><strong id="channel-traffic-rate">--</strong></div>
+              <div><span>订单识别率</span><strong id="channel-order-rate">--</strong></div>
             </div>
             <div class="table-wrap">
-              <table>
+              <table class="channel-table" id="channel-table">
                 <thead>
                   <tr>
                     <th>来源</th>
+                    <th>UTM 明细</th>
+                    <th>会话</th>
+                    <th>用户</th>
                     <th>订单</th>
+                    <th>转化</th>
                     <th>销售额</th>
-                    <th>占比</th>
                   </tr>
                 </thead>
                 <tbody id="channel-rows"></tbody>
@@ -241,12 +378,13 @@
             </div>
           </article>
 
-          <article class="panel">
+          <article class="panel" id="alerts">
             <div class="panel-header">
               <div>
                 <p>Signals</p>
                 <h2>预警信号</h2>
               </div>
+              <button type="button" class="button ghost compact" id="restore-alerts-btn" hidden>恢复已忽略</button>
             </div>
             <div class="signal-list" id="alert-list"></div>
           </article>
@@ -278,6 +416,9 @@
                 <span>商品成本</span>
                 <strong id="profit-product-cost">--</strong>
               </div>
+              <div><span>净销售额</span><strong id="profit-net-revenue">--</strong></div>
+              <div><span>退款金额</span><strong id="profit-refunds">--</strong></div>
+              <div><span>SKU 成本覆盖</span><strong id="profit-cost-coverage">--</strong></div>
             </div>
             <dl class="cost-list">
               <div><dt>商品成本率</dt><dd id="profit-cost-rate">--</dd></div>
@@ -295,7 +436,7 @@
               </div>
             </div>
             <div class="table-wrap">
-              <table>
+              <table id="ad-table">
                 <thead>
                   <tr>
                     <th>渠道</th>
@@ -324,7 +465,10 @@
               <div><span>新客</span><strong id="customer-new">--</strong></div>
               <div><span>复购客户</span><strong id="customer-repeat">--</strong></div>
               <div><span>复购订单率</span><strong id="customer-repeat-rate">--</strong></div>
+              <div><span>平均 LTV</span><strong id="customer-ltv">--</strong></div>
+              <div><span>人均订单</span><strong id="customer-frequency">--</strong></div>
             </div>
+            <div class="rfm-segments" id="customer-segments"></div>
             <ol class="rank-list" id="customer-list"></ol>
           </article>
 
@@ -347,7 +491,7 @@
             </div>
           </div>
           <div class="table-wrap">
-            <table>
+            <table id="product-table">
               <thead>
                 <tr>
                   <th>商品</th>
@@ -389,7 +533,7 @@
               <button type="button" class="button ghost" id="order-export-btn">导出 CSV</button>
             </div>
             <div class="table-wrap">
-              <table>
+              <table id="order-table">
                 <thead>
                   <tr>
                     <th>订单</th>
@@ -402,28 +546,18 @@
                 <tbody id="order-rows"></tbody>
               </table>
             </div>
-            <div class="order-footer">
-              <div class="order-summary">
-                <span id="order-scope">--</span>
-                <strong id="order-summary">--</strong>
-              </div>
-              <div class="order-pagination" aria-label="订单分页">
-                <button class="page-nav" id="order-prev-btn" type="button" aria-label="上一页" title="上一页">‹</button>
-                <span class="page-status" id="order-page-status">--</span>
-                <button class="page-nav" id="order-next-btn" type="button" aria-label="下一页" title="下一页">›</button>
-              </div>
-            </div>
           </article>
 
-          <article class="panel">
-            <div class="panel-header">
+          <details class="panel disclosure-panel sync-log-panel">
+            <summary class="panel-summary">
               <div>
                 <p>Activity</p>
                 <h2>同步动态</h2>
               </div>
-            </div>
-            <ol class="event-list" id="event-list"></ol>
-          </article>
+              <span class="summary-status"><b>默认折叠</b><i aria-hidden="true"></i></span>
+            </summary>
+            <div class="disclosure-content"><ol class="event-list" id="event-list"></ol></div>
+          </details>
         </section>
       </main>
     </div>
@@ -432,6 +566,16 @@
       <span aria-hidden="true">↑</span>
     </button>
     <div class="toast" id="toast" hidden></div>
+    <div class="auth-gate" id="auth-gate" hidden>
+      <form class="auth-card" id="auth-form">
+        <span class="auth-kicker">SOSOVE SECURE ACCESS</span>
+        <h2>进入品牌数据塔台</h2>
+        <p>输入面板访问令牌，令牌仅保存在当前浏览器会话。</p>
+        <input type="password" id="auth-token" autocomplete="current-password" placeholder="Dashboard access token" aria-label="面板访问令牌">
+        <button type="submit" class="button primary">验证并进入</button>
+        <small id="auth-error"></small>
+      </form>
+    </div>
     <script src="/static/app.js" defer></script>
   </body>
 </html>

@@ -3,13 +3,21 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
+import os
+import secrets
 from datetime import date
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from shopline_monitor.backend import ShoplineClient, build_dashboard_payload, now_iso
+from shopline_monitor.backend import (
+    ShoplineClient,
+    build_dashboard_payload,
+    deliver_alert_webhook,
+    now_iso,
+    probe_integrations,
+)
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -36,6 +44,11 @@ class ShoplineMonitorHandler(BaseHTTPRequestHandler):
         if path == "/api/health":
             self.send_json({"ok": True, "service": "shopline-monitor", "time": now_iso()})
             return
+        if path == "/api/auth/status":
+            self.send_json(auth_status())
+            return
+        if path.startswith("/api/") and not self.require_api_access(write=False):
+            return
         if path == "/api/connector":
             self.send_json(ShoplineClient().connector_status())
             return
@@ -43,20 +56,54 @@ class ShoplineMonitorHandler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query)
             range_key = query.get("range", ["7d"])[0]
             selected_date = parse_date_param(query.get("date", [""])[0])
-            self.send_json(build_dashboard_payload(range_key, today=selected_date))
+            filters = extract_dashboard_filters(query)
+            self.send_json(build_dashboard_payload(range_key, today=selected_date, filters=filters))
             return
         self.send_error_json(HTTPStatus.NOT_FOUND, "route not found")
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/auth/login":
+            payload = self.read_json_body()
+            supplied = str(payload.get("token") or "") if isinstance(payload, dict) else ""
+            if verify_dashboard_token(supplied):
+                self.send_json({"ok": True, **auth_status()})
+            else:
+                self.send_error_json(HTTPStatus.UNAUTHORIZED, "access token is invalid")
+            return
+        if parsed.path.startswith("/api/") and not self.require_api_access(write=True):
+            return
         if parsed.path == "/api/sync":
             payload = self.read_json_body()
             range_key = str(payload.get("range", "7d")) if isinstance(payload, dict) else "7d"
             selected_date = parse_date_param(str(payload.get("date", ""))) if isinstance(payload, dict) else None
-            self.send_json(build_dashboard_payload(range_key, today=selected_date))
+            filters = normalize_filter_payload(payload.get("filters") if isinstance(payload, dict) else {})
+            self.send_json(
+                build_dashboard_payload(
+                    range_key,
+                    today=selected_date,
+                    filters=filters,
+                    force_refresh=True,
+                )
+            )
             return
         if parsed.path == "/api/connector/test":
-            self.send_json(ShoplineClient().test_connection())
+            self.send_json(probe_integrations())
+            return
+        if parsed.path == "/api/alerts/notify":
+            payload = self.read_json_body()
+            raw_alert = payload.get("alert") if isinstance(payload, dict) else None
+            if not isinstance(raw_alert, dict):
+                self.send_error_json(HTTPStatus.BAD_REQUEST, "alert payload is required")
+                return
+            alert = {
+                "id": str(raw_alert.get("id") or "")[:64],
+                "level": str(raw_alert.get("level") or "info")[:24],
+                "title": str(raw_alert.get("title") or "SOSOVE 数据预警")[:120],
+                "message": str(raw_alert.get("message") or "")[:1200],
+            }
+            delivery = deliver_alert_webhook([alert], force_refresh=True, manual=True)
+            self.send_json({"ok": bool(delivery.get("delivered")), **delivery})
             return
         self.send_error_json(HTTPStatus.NOT_FOUND, "route not found")
 
@@ -77,7 +124,13 @@ class ShoplineMonitorHandler(BaseHTTPRequestHandler):
         self.send_common_headers(content_type=content_type, cache=False)
         self.send_header("Content-Length", str(len(content)))
         self.end_headers()
-        self.wfile.write(content)
+        try:
+            self.wfile.write(content)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            # Browsers cancel superseded dashboard requests during rapid filter
+            # changes. The request is already complete, so this is not a server
+            # failure and should not fill the error log with socket tracebacks.
+            return
 
     def send_json(self, payload: object, status: HTTPStatus = HTTPStatus.OK) -> None:
         content = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -85,7 +138,10 @@ class ShoplineMonitorHandler(BaseHTTPRequestHandler):
         self.send_common_headers(content_type="application/json; charset=utf-8", cache=False)
         self.send_header("Content-Length", str(len(content)))
         self.end_headers()
-        self.wfile.write(content)
+        try:
+            self.wfile.write(content)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            return
 
     def send_error_json(self, status: HTTPStatus, message: str) -> None:
         self.send_json({"ok": False, "error": message}, status=status)
@@ -98,7 +154,7 @@ class ShoplineMonitorHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Dashboard-Token")
         if not cache:
             self.send_header("Cache-Control", "no-store")
 
@@ -114,6 +170,60 @@ class ShoplineMonitorHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args: object) -> None:
         print(f"[shopline-monitor] {self.address_string()} - {format % args}")
+
+    def require_api_access(self, write: bool) -> bool:
+        if not dashboard_auth_enabled():
+            return True
+        supplied = self.headers.get("X-Dashboard-Token", "")
+        authorization = self.headers.get("Authorization", "")
+        if authorization.lower().startswith("bearer "):
+            supplied = authorization[7:].strip()
+        if not verify_dashboard_token(supplied):
+            self.send_error_json(HTTPStatus.UNAUTHORIZED, "dashboard authentication required")
+            return False
+        if write and dashboard_role() == "viewer":
+            self.send_error_json(HTTPStatus.FORBIDDEN, "viewer role is read-only")
+            return False
+        return True
+
+
+def dashboard_auth_enabled() -> bool:
+    return bool(os.getenv("DASHBOARD_ACCESS_TOKEN", "").strip())
+
+
+def dashboard_role() -> str:
+    role = os.getenv("DASHBOARD_ROLE", "admin").strip().lower()
+    return role if role in {"admin", "operator", "viewer"} else "admin"
+
+
+def verify_dashboard_token(supplied: str) -> bool:
+    expected = os.getenv("DASHBOARD_ACCESS_TOKEN", "").strip()
+    if not expected:
+        return True
+    return secrets.compare_digest(str(supplied or ""), expected)
+
+
+def auth_status() -> dict[str, object]:
+    return {
+        "configured": dashboard_auth_enabled(),
+        "role": dashboard_role(),
+    }
+
+
+def extract_dashboard_filters(query: dict[str, list[str]]) -> dict[str, str]:
+    return {
+        key: str(query.get(key, [""])[0] or "").strip()
+        for key in ("channel", "status", "market", "product")
+    }
+
+
+def normalize_filter_payload(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: str(value.get(key) or "").strip()
+        for key in ("channel", "status", "market", "product")
+    }
 
 
 def run(host: str, port: int) -> None:

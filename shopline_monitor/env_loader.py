@@ -36,7 +36,8 @@ def _normalize_paths(paths: Iterable[Path | str]) -> list[Path]:
 
 def _load_env_file(path: Path) -> list[str]:
     loaded: list[str] = []
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
+    # utf-8-sig accepts regular UTF-8 and strips a Windows UTF-8 BOM when present.
+    for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
