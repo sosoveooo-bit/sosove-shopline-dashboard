@@ -19,6 +19,7 @@ SHOPLINE_API_BASE_URL=https://jp-sosove.myshopline.com
 SHOPLINE_ACCESS_TOKEN=your-shopline-api-token
 SHOPLINE_ORDERS_ENDPOINT=/orders
 SHOPLINE_PRODUCTS_ENDPOINT=/products
+SHOPLINE_ORDER_ATTRIBUTION_ENDPOINT=/orders/order_attribution_info.json
 
 SHOPLINE_API_VERSION=v20260301
 SHOPLINE_STORE_DOMAIN=jp-sosove.myshopline.com
@@ -28,7 +29,9 @@ SHOPLINE_AUTH_PREFIX=Bearer
 SHOPLINE_DEFAULT_CURRENCY=JPY
 SHOPLINE_TIMEZONE=Asia/Tokyo
 SHOPLINE_MAX_ORDER_PAGES=10
-SHOPLINE_TIMEOUT_SECONDS=12
+SHOPLINE_ORDER_CHUNK_DAYS=3
+SHOPLINE_TIMEOUT_SECONDS=30
+SHOPLINE_RETRY_ATTEMPTS=3
 DASHBOARD_CACHE_SECONDS=120
 
 SHOPLINE_CONVERSION_TRAFFIC_FIELD=visitors
@@ -53,7 +56,11 @@ DASHBOARD_ROLE=admin
 SHOPLINE_AD_SPEND_JSON={"Facebook":0,"Instagram":0,"Google":0,"TikTok":0,"Email":0,"Direct":0,"Organic":0,"Ad":0}
 ```
 
-`SHOPLINE_TIMEZONE` controls the "today" boundary for order queries. Increase `SHOPLINE_MAX_ORDER_PAGES` if a selected period has more than 1,000 orders.
+`SHOPLINE_TIMEZONE` controls the "today" boundary for order queries. Production defaults use three-day order windows and up to 10 pages per window, preventing high-volume 30-day comparisons from being truncated.
+
+Channel orders use SHOPLINE's official last-touch attribution first. GA4 aliases such as `smartpush/email` and `wangao/wangao` are normalized to SmartPush. The channel table exposes both SHOPLINE orders/GA4 sessions and GA4 Purchase/sessions, plus an order-level audit dialog for UTM and Campaign verification.
+
+Transient SHOPLINE requests retry automatically. A failed refresh keeps the last successful live snapshot instead of replacing real data with demo orders. Historical order windows are cached so subsequent live refreshes only request the current window.
 
 Conversion rate is calculated as `orders / visitors * 100` by default. Shopline order/product APIs do not include store visitor counts, so live dashboards show `--` until traffic data is configured. Add daily traffic from Shopline analytics, GA4, or another traffic source:
 

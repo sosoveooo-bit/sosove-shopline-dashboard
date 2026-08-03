@@ -1956,7 +1956,7 @@ button {
 
 .channel-insights {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
   margin: -2px 0 12px;
 }
@@ -1983,6 +1983,7 @@ button {
 }
 
 .channel-insights span,
+.channel-insights small,
 .channel-mini,
 .channel-detail {
   color: var(--muted);
@@ -1996,6 +1997,21 @@ button {
   font-size: 16px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.channel-insights small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.channel-insights .smartpush-insight {
+  background: linear-gradient(135deg, rgba(173, 112, 255, 0.14), rgba(99, 216, 255, 0.04));
+  border-color: rgba(173, 112, 255, 0.22);
+}
+
+.channel-insights .smartpush-insight::after {
+  background: linear-gradient(90deg, #ad70ff, var(--cyan), transparent);
 }
 
 .channel-table {
@@ -2030,9 +2046,11 @@ button {
 .channel-facebook { color: #5d8dff; background: #5d8dff; }
 .channel-instagram { color: #f15ec4; background: #f15ec4; }
 .channel-google { color: #63d8ff; background: #63d8ff; }
+.channel-google-ads { color: #4f8cff; background: #4f8cff; }
 .channel-tiktok { color: #4cffb1; background: #4cffb1; }
 .channel-youtube { color: #ff5c71; background: #ff5c71; }
 .channel-email { color: #ffbf58; background: #ffbf58; }
+.channel-smartpush { color: #ad70ff; background: #ad70ff; }
 .channel-line { color: #2ee66b; background: #2ee66b; }
 .channel-sms-push { color: #d07bff; background: #d07bff; }
 .channel-ai-chat { color: #7b9cff; background: #7b9cff; }
@@ -2046,6 +2064,74 @@ button {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.channel-official {
+  color: var(--green);
+  font-weight: 700;
+}
+
+.channel-drill-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 27px;
+  margin: 7px 0 0 15px;
+  padding: 0 8px;
+  color: var(--ink-soft);
+  background: rgba(173, 112, 255, 0.08);
+  border: 1px solid rgba(173, 112, 255, 0.18);
+  border-radius: 6px;
+  font-size: 9px;
+  font-weight: 800;
+}
+
+.channel-drill-button:hover {
+  color: var(--ink);
+  background: rgba(173, 112, 255, 0.14);
+  border-color: rgba(173, 112, 255, 0.32);
+}
+
+.channel-drill-button b { color: #ad70ff; font-size: 10px; }
+.channel-drill-button i { color: var(--cyan); font-style: normal; }
+
+.channel-conversion {
+  position: relative;
+  display: grid;
+  gap: 4px;
+  min-width: 86px;
+}
+
+.channel-conversion span {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  color: var(--ink-soft);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.channel-conversion b {
+  min-width: 30px;
+  color: var(--muted);
+  font-size: 8px;
+}
+
+.conversion-warning {
+  position: absolute;
+  top: -5px;
+  right: -7px;
+  display: grid;
+  width: 15px;
+  height: 15px;
+  place-items: center;
+  color: #17131f;
+  background: var(--yellow);
+  border-radius: 50%;
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 950;
 }
 
 .channel-share {
@@ -2069,6 +2155,86 @@ button {
   display: block;
   margin-top: 3px;
 }
+
+.channel-order-dialog {
+  width: min(940px, calc(100vw - 32px));
+  max-width: none;
+  max-height: none;
+  padding: 0;
+  overflow: hidden;
+  color: var(--ink);
+  background: var(--panel-strong);
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  box-shadow: 0 28px 90px rgba(0, 0, 0, 0.52);
+}
+
+.channel-order-dialog::backdrop {
+  background: rgba(4, 9, 16, 0.72);
+  backdrop-filter: blur(7px);
+}
+
+.channel-dialog-shell {
+  display: grid;
+  grid-template-rows: auto auto auto minmax(160px, 1fr) auto;
+  max-height: min(86vh, 760px);
+}
+
+.channel-dialog-header,
+.channel-dialog-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px 18px;
+  background: color-mix(in srgb, var(--panel-strong) 96%, var(--cyan) 4%);
+}
+
+.channel-dialog-header { border-bottom: 1px solid var(--line); }
+.channel-dialog-header p { margin: 0 0 4px; color: var(--cyan); font-size: 9px; font-weight: 900; letter-spacing: 0.12em; }
+.channel-dialog-header h2 { margin: 0; color: var(--ink); font-size: 20px; }
+.channel-dialog-header span { display: block; margin-top: 4px; color: var(--muted); font-size: 10px; }
+.channel-dialog-close {
+  flex: 0 0 auto;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  color: var(--ink-soft);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 22px;
+  line-height: 1;
+}
+
+.channel-dialog-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  padding: 12px 18px 8px;
+}
+
+.channel-dialog-metrics > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  padding: 10px;
+  background: rgba(99, 216, 255, 0.035);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+}
+
+.channel-dialog-metrics span,
+.channel-dialog-metrics small { overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.channel-dialog-metrics strong { color: var(--ink); font-size: 16px; }
+.channel-dialog-note { margin: 0; padding: 2px 18px 10px; color: var(--muted); font-size: 10px; }
+.channel-dialog-table-wrap { overflow: auto; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.channel-dialog-table { min-width: 820px; }
+.channel-dialog-table thead th { position: sticky; top: 0; z-index: 2; background: var(--panel-strong); }
+.channel-dialog-table td { vertical-align: top; }
+.channel-dialog-table td small { display: block; max-width: 230px; margin-top: 3px; overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.channel-dialog-footer { min-height: 58px; }
+.channel-dialog-footer > span { color: var(--muted); font-size: 10px; }
 
 .utm-empty {
   color: var(--muted);
@@ -3442,7 +3608,7 @@ tbody tr:hover {
   }
 
   .channel-insights {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 6px;
   }
 
@@ -4373,6 +4539,47 @@ table[data-managed-table="true"] thead th {
   .signal-actions button { min-height: 31px; }
   .panel-summary { min-height: 62px; padding: 14px; }
   .disclosure-content { padding: 0 14px 14px; }
+
+  .channel-order-dialog {
+    width: calc(100vw - 16px);
+  }
+
+  .channel-dialog-shell {
+    max-height: calc(100vh - 16px);
+  }
+
+  .channel-dialog-header,
+  .channel-dialog-footer { padding: 12px; }
+  .channel-dialog-header h2 { font-size: 17px; }
+  .channel-dialog-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); padding: 9px 12px 6px; }
+  .channel-dialog-metrics > div { padding: 8px; }
+  .channel-dialog-note { padding: 2px 12px 8px; }
+  .channel-dialog-footer { align-items: stretch; flex-direction: column; }
+  .channel-dialog-footer .button { flex: 0 0 40px; width: 100%; min-height: 40px; }
+  .channel-dialog-table { display: block; min-width: 0; }
+  .channel-dialog-table thead { display: none; }
+  .channel-dialog-table tbody { display: block; }
+  .channel-dialog-table tr {
+    display: grid;
+    grid-template-areas:
+      "order amount"
+      "date status"
+      "tracking tracking"
+      "attribution attribution";
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 9px 12px;
+    padding: 12px;
+    border-bottom: 1px solid var(--line);
+  }
+  .channel-dialog-table td { display: grid; gap: 3px; min-width: 0; padding: 0; border: 0; }
+  .channel-dialog-table td::before { content: attr(data-label); color: var(--muted); font-size: 8px; font-weight: 850; text-transform: uppercase; }
+  .channel-dialog-table td:nth-child(1) { grid-area: order; }
+  .channel-dialog-table td:nth-child(2) { grid-area: date; }
+  .channel-dialog-table td:nth-child(3) { grid-area: status; justify-items: end; text-align: right; }
+  .channel-dialog-table td:nth-child(4) { grid-area: tracking; }
+  .channel-dialog-table td:nth-child(5) { grid-area: attribution; }
+  .channel-dialog-table td:nth-child(6) { grid-area: amount; justify-items: end; text-align: right; }
+  .channel-dialog-table td small { max-width: none; white-space: normal; overflow-wrap: anywhere; }
 }
 
 @media (max-width: 360px) {

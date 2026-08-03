@@ -175,6 +175,12 @@ function bindControls() {
   document.getElementById("copy-click-map-btn").addEventListener("click", copyClickMappingTemplate);
   document.getElementById("restore-alerts-btn").addEventListener("click", restoreDismissedAlerts);
   document.getElementById("alert-list").addEventListener("click", handleAlertAction);
+  document.getElementById("channels").addEventListener("click", handleChannelPanelAction);
+  document.getElementById("channel-dialog-close").addEventListener("click", closeChannelDialog);
+  document.getElementById("channel-dialog-filter").addEventListener("click", filterChannelOrders);
+  document.getElementById("channel-order-dialog").addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) closeChannelDialog();
+  });
 
   document.getElementById("auth-form").addEventListener("submit", handleAuthSubmit);
 }
@@ -549,8 +555,8 @@ function renderDataTrust(reconciliation = {}, quality = {}, campaigns = {}, diag
   setText("campaign-coverage", formatOptionalPercent(campaigns.coverage));
   const attributionSummary = diagnostics?.summary || {};
   document.getElementById("attribution-facts").innerHTML = [
-    ["订单归因", quality.attributionRate],
-    ["Campaign", quality.campaignCoverage],
+    ["官方归因", quality.officialAttributionRate],
+    ["来源识别", quality.attributionRate],
     ["UTM 完整", attributionSummary.utmCoverage],
     ["Click 映射", attributionSummary.clickMappingRate],
   ].map(([label, value]) => `<div><span>${label}</span><strong>${formatOptionalPercent(value)}</strong></div>`).join("");
@@ -681,7 +687,7 @@ async function initializeAccess() {
     }
     applyRolePermissions();
     initializeAutoRefresh();
-    loadDashboard({ force: state.role !== "viewer" });
+    loadDashboard();
   } catch (error) {
     showError(error.message);
   }
@@ -705,7 +711,7 @@ async function handleAuthSubmit(event) {
     document.getElementById("auth-gate").hidden = true;
     applyRolePermissions();
     initializeAutoRefresh();
-    loadDashboard({ force: state.role !== "viewer" });
+    loadDashboard();
   } catch (error) {
     errorNode.textContent = error.message;
   }
@@ -729,37 +735,125 @@ function renderChannels(channels, currency, analytics = {}) {
   const safeChannels = Array.isArray(channels) ? channels : [];
   setText("channel-mode", analytics.label || "Shopline 订单归因");
   setText("channel-sessions", analytics.sessions ? formatNumber(analytics.sessions) : "--");
-  setText("channel-traffic-rate", formatOptionalPercent(analytics.attributionRate));
   setText("channel-order-rate", formatOptionalPercent(analytics.orderAttributionRate));
+  setText("channel-official-rate", formatOptionalPercent(analytics.officialAttributionRate));
+  setText("channel-smartpush-orders", `${formatNumber(analytics.smartPushOrders || 0)} 单`);
+  setText("channel-smartpush-revenue", formatCurrency(analytics.smartPushRevenue || 0, currency));
 
   renderManagedTable({
     tableId: "channel-table",
     rows: safeChannels,
     emptyText: "暂无渠道数据",
     pageSize: 8,
-    defaultSort: { key: analytics.sessions ? "sessions" : "revenue", direction: "desc" },
+    defaultSort: { key: "orders", direction: "desc" },
     columns: [
       { key: "channel", label: "来源", render: (channel) => {
     const details = (channel.sourceDetails || [])
       .map((item) => `${escapeHtml(item.label)} · ${formatNumber(item.sessions)}`)
       .join("<br>");
-    const detailNode = details
-      ? `<span class="channel-detail" title="${escapeHtml((channel.sourceDetails || []).map((item) => `${item.label}: ${item.sessions}`).join(" | "))}">${details}</span>`
-      : `<span class="channel-detail">${escapeHtml(channel.sourceRaw || "Shopline 订单归因")}</span>`;
+    const officialOrders = Number(channel.officialOrders) || 0;
+    const officialDetail = channel.orders
+      ? `SHOPLINE 官方归因 ${formatNumber(officialOrders)}/${formatNumber(channel.orders)} 单`
+      : "仅有 GA4 流量，暂无订单";
+    const detailNode = [
+      channel.orders ? `<span class="channel-detail channel-official">${escapeHtml(officialDetail)}</span>` : "",
+      details
+        ? `<span class="channel-detail" title="${escapeHtml((channel.sourceDetails || []).map((item) => `${item.label}: ${item.sessions}`).join(" | "))}">${details}</span>`
+        : "",
+    ].filter(Boolean).join("");
     return `
         <strong class="channel-name"><i class="channel-dot channel-${channelClass(channel.channel)}"></i>${escapeHtml(channel.channel)}</strong>
         ${detailNode}
         <span class="channel-share"><i style="width:${Math.max(0, Math.min(100, Number(channel.share) || 0))}%"></i></span>
+        ${channel.orders ? `<button type="button" class="channel-drill-button" data-channel-drill="${escapeHtml(channel.channel)}">订单明细 <b>${formatNumber(channel.orderDetailCount || channel.orders)}</b><i aria-hidden="true">↗</i></button>` : ""}
       `;
       } },
       { key: "utmCoverage", label: "UTM 明细", type: "number", render: (channel) => renderChannelUtm(channel, currency) },
       { key: "sessions", label: "会话", type: "number", render: (channel) => `${channel.sessions ? formatNumber(channel.sessions) : "--"}<span class="channel-mini">${channel.sessions ? formatPercent(channel.share) : "GA4 待同步"}</span>` },
       { key: "activeUsers", label: "用户", type: "number", render: (channel) => channel.activeUsers ? formatNumber(channel.activeUsers) : "--" },
       { key: "orders", label: "订单", type: "number", render: (channel) => formatNumber(channel.orders) },
-      { key: "conversion", label: "转化", type: "number", render: (channel) => formatOptionalPercent(channel.conversion) },
+      { key: "shoplineConversion", label: "双转化", type: "number", render: (channel) => renderChannelConversion(channel) },
       { key: "revenue", label: "销售额", type: "number", render: (channel) => formatCurrency(channel.revenue, currency) },
     ],
   });
+}
+
+function renderChannelConversion(channel) {
+  if (!channel.sessions) {
+    return '<span class="utm-empty">GA4 待同步</span>';
+  }
+  const warning = channel.conversionComparable === false
+    ? `<i class="conversion-warning" title="${escapeHtml(channel.conversionNote || "渠道会话无法完全拆分")}">!</i>`
+    : "";
+  return `
+    <div class="channel-conversion" title="SHOPLINE：订单 ÷ GA4 会话；GA4：Purchase ÷ 会话">
+      <span><b>SL</b>${formatOptionalPercent(channel.shoplineConversion)}</span>
+      <span><b>GA4</b>${formatOptionalPercent(channel.ga4Conversion)}</span>
+      ${warning}
+    </div>
+  `;
+}
+
+function handleChannelPanelAction(event) {
+  const button = event.target.closest("[data-channel-drill]");
+  if (!button || !state.payload) return;
+  const channel = (state.payload.channels || []).find((row) => row.channel === button.dataset.channelDrill);
+  if (!channel) return;
+  openChannelDialog(channel, state.payload.currency);
+}
+
+function openChannelDialog(channel, currency) {
+  const dialog = document.getElementById("channel-order-dialog");
+  dialog.dataset.channel = channel.channel;
+  setText("channel-dialog-title", `${channel.channel} 订单核对`);
+  setText("channel-dialog-subtitle", `${formatNumber(channel.sessions || 0)} 会话 · ${formatNumber(channel.activeUsers || 0)} 用户`);
+  setText("channel-dialog-orders", `${formatNumber(channel.orders || 0)} 单`);
+  setText("channel-dialog-revenue", formatCurrency(channel.revenue || 0, currency));
+  setText("channel-dialog-official", `${formatNumber(channel.officialOrders || 0)}/${formatNumber(channel.orders || 0)} 单`);
+  setText("channel-dialog-shopline-rate", formatOptionalPercent(channel.shoplineConversion));
+  setText("channel-dialog-ga4-rate", formatOptionalPercent(channel.ga4Conversion));
+  setText("channel-dialog-note", channel.conversionNote || "SHOPLINE 订单与 GA4 会话的跨系统核对");
+  setText("channel-dialog-count", `显示最近 ${formatNumber((channel.orderDetails || []).length)} 笔 · 渠道共 ${formatNumber(channel.orderDetailCount || channel.orders || 0)} 单`);
+  const rows = (channel.orderDetails || []).map((order) => {
+    const tracking = [order.utmSource, order.utmMedium].filter(Boolean).join(" / ");
+    const attribution = order.attributionMethod === "shopline_attribution" ? "SHOPLINE 官方" : (order.attributionMethod || "字段推断");
+    return `
+      <tr>
+        <td data-label="订单"><strong title="${escapeHtml(order.id)}">${escapeHtml(compactOrderId(order.id))}</strong></td>
+        <td data-label="日期">${escapeHtml(order.createdAt || "--")}</td>
+        <td data-label="状态"><span class="pill ${statusTone(order)}">${escapeHtml(order.status || "--")}</span></td>
+        <td data-label="UTM / Campaign"><span>${escapeHtml(tracking || "未捕获 UTM")}</span><small>${escapeHtml(order.campaign || "无 Campaign")}</small></td>
+        <td data-label="归因"><span>${escapeHtml(attribution)}</span><small>${escapeHtml(order.attributionConfidence || "--")}</small></td>
+        <td data-label="金额"><strong>${formatCurrency(order.total || 0, currency)}</strong></td>
+      </tr>
+    `;
+  }).join("");
+  document.getElementById("channel-dialog-order-rows").innerHTML = rows || '<tr><td colspan="6" class="empty">暂无订单明细</td></tr>';
+  if (typeof dialog.showModal === "function") dialog.showModal();
+}
+
+function closeChannelDialog() {
+  const dialog = document.getElementById("channel-order-dialog");
+  if (dialog.open) dialog.close();
+}
+
+function filterChannelOrders() {
+  const dialog = document.getElementById("channel-order-dialog");
+  const channel = dialog.dataset.channel || "";
+  const sourceSelect = document.getElementById("order-source-filter");
+  if (sourceSelect && [...sourceSelect.options].some((option) => option.value === channel)) {
+    state.orderSource = channel;
+    sourceSelect.value = channel;
+    resetTablePage("order-table");
+    renderOrders(state.payload?.orders || [], state.payload?.currency, state.payload?.range);
+  }
+  closeChannelDialog();
+  focusPanel("orders");
+}
+
+function compactOrderId(value) {
+  const text = String(value || "");
+  return text.length > 16 ? `…${text.slice(-15)}` : text || "--";
 }
 
 function renderChannelUtm(channel, currency) {

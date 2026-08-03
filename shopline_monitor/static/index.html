@@ -357,8 +357,13 @@
             </div>
             <div class="channel-insights" id="channel-insights" aria-label="渠道归因概览">
               <div><span>GA4 渠道会话</span><strong id="channel-sessions">--</strong></div>
-              <div><span>流量识别率</span><strong id="channel-traffic-rate">--</strong></div>
               <div><span>订单识别率</span><strong id="channel-order-rate">--</strong></div>
+              <div><span>SHOPLINE 官方归因</span><strong id="channel-official-rate">--</strong></div>
+              <div class="smartpush-insight">
+                <span>SmartPush 官方归因</span>
+                <strong id="channel-smartpush-orders">--</strong>
+                <small id="channel-smartpush-revenue">--</small>
+              </div>
             </div>
             <div class="table-wrap">
               <table class="channel-table" id="channel-table">
@@ -565,6 +570,35 @@
     <button type="button" class="scroll-top-button" id="scroll-top-btn" aria-label="回到顶部" title="回到顶部" hidden>
       <span aria-hidden="true">↑</span>
     </button>
+    <dialog class="channel-order-dialog" id="channel-order-dialog" aria-labelledby="channel-dialog-title">
+      <div class="channel-dialog-shell">
+        <header class="channel-dialog-header">
+          <div>
+            <p>SHOPLINE ATTRIBUTION AUDIT</p>
+            <h2 id="channel-dialog-title">渠道订单核对</h2>
+            <span id="channel-dialog-subtitle">--</span>
+          </div>
+          <button type="button" class="channel-dialog-close" id="channel-dialog-close" aria-label="关闭" title="关闭">×</button>
+        </header>
+        <section class="channel-dialog-metrics" aria-label="渠道核对指标">
+          <div><span>订单 / 销售额</span><strong id="channel-dialog-orders">--</strong><small id="channel-dialog-revenue">--</small></div>
+          <div><span>官方归因</span><strong id="channel-dialog-official">--</strong><small>SHOPLINE last touch</small></div>
+          <div><span>SHOPLINE 转化</span><strong id="channel-dialog-shopline-rate">--</strong><small>订单 ÷ GA4 会话</small></div>
+          <div><span>GA4 转化</span><strong id="channel-dialog-ga4-rate">--</strong><small>Purchase ÷ 会话</small></div>
+        </section>
+        <p class="channel-dialog-note" id="channel-dialog-note">--</p>
+        <div class="channel-dialog-table-wrap">
+          <table class="channel-dialog-table">
+            <thead><tr><th>订单</th><th>日期</th><th>状态</th><th>UTM / Campaign</th><th>归因</th><th>金额</th></tr></thead>
+            <tbody id="channel-dialog-order-rows"></tbody>
+          </table>
+        </div>
+        <footer class="channel-dialog-footer">
+          <span id="channel-dialog-count">--</span>
+          <button type="button" class="button primary compact" id="channel-dialog-filter">在今日订单中筛选</button>
+        </footer>
+      </div>
+    </dialog>
     <div class="toast" id="toast" hidden></div>
     <div class="auth-gate" id="auth-gate" hidden>
       <form class="auth-card" id="auth-form">

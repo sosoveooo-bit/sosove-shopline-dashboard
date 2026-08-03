@@ -18,6 +18,7 @@ from shopline_monitor.backend import (
     build_dashboard_payload,
     build_ga4_status,
     build_campaign_breakdown,
+    build_channel_analytics,
     build_channels,
     build_alerts_v2,
     build_ad_performance,
@@ -32,6 +33,7 @@ from shopline_monitor.backend import (
     next_page_info_from_link,
     normalize_ga4_rate,
     normalize_ga4_channel_rows,
+    normalize_ga4_channel,
     normalize_base_url,
     normalize_endpoint_path,
     normalize_shopline_orders,
@@ -40,6 +42,8 @@ from shopline_monitor.backend import (
     probe_ga4_connection,
     apply_dashboard_filters,
     deduplicate_orders,
+    clear_data_cache,
+    clear_live_data_cache,
 )
 from shopline_monitor.server import dashboard_auth_enabled, parse_date_param, verify_dashboard_token
 
@@ -152,6 +156,64 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(orders[0]["attributionMethod"], "utm")
         self.assertEqual(orders[0]["attributionConfidence"], "high")
 
+    def test_normalize_orders_prefers_shopline_official_last_touch_attribution(self):
+        payload = {
+            "orders": [
+                {"order_id": "smartpush-1", "total_price": "8430"},
+                {"order_id": "instagram-1", "total_price": "6880"},
+                {"order_id": "google-ads-1", "total_price": "6980"},
+            ]
+        }
+        attribution = {
+            "smartpush-1": {
+                "order_seq": "smartpush-1",
+                "last_interaction": {
+                    "last_interaction_source": "Other",
+                    "last_referrer_name": "smartpush",
+                    "last_referrer_url": None,
+                    "last_utm_parameters": {
+                        "last_utm_source": "wangao",
+                        "last_utm_medium": "email",
+                        "last_utm_campaign": "welcome-series",
+                    },
+                },
+            },
+            "instagram-1": {
+                "order_seq": "instagram-1",
+                "last_interaction": {
+                    "last_interaction_source": "Social",
+                    "last_referrer_name": "Instagram",
+                    "last_referrer_url": "https://instagram.com/",
+                    "last_utm_parameters": {},
+                },
+            },
+            "google-ads-1": {
+                "order_seq": "google-ads-1",
+                "last_interaction": {
+                    "last_interaction_source": "Search",
+                    "last_referrer_name": "GoogleAds",
+                    "last_referrer_url": None,
+                    "last_utm_parameters": {},
+                },
+            },
+        }
+
+        orders = normalize_shopline_orders(
+            payload,
+            default_currency="JPY",
+            attribution_by_order_id=attribution,
+        )
+
+        self.assertEqual(
+            [order["source"] for order in orders],
+            ["SmartPush", "Instagram", "Google Ads"],
+        )
+        self.assertEqual(orders[0]["sourceUtm"], "wangao")
+        self.assertEqual(orders[0]["sourceMedium"], "email")
+        self.assertEqual(orders[0]["sourceCampaign"], "welcome-series")
+        self.assertEqual(orders[0]["attributionMethod"], "shopline_attribution")
+        self.assertEqual(orders[0]["attributionConfidence"], "high")
+
     def test_ga4_channels_merge_sessions_with_shopline_orders(self):
         response = SimpleNamespace(
             dimension_headers=[
@@ -202,8 +264,19 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(grouped["Facebook"]["sessions"], 100)
         self.assertEqual(grouped["Facebook"]["orders"], 1)
         self.assertEqual(grouped["Facebook"]["conversion"], 4)
+        self.assertEqual(grouped["Facebook"]["ga4Conversion"], 4)
+        self.assertEqual(grouped["Facebook"]["shoplineConversion"], 1)
         self.assertEqual(grouped["LINE"]["sessions"], 20)
         self.assertEqual(grouped["LINE"]["orders"], 0)
+
+    def test_ga4_channel_normalizes_smartpush_aliases_before_email_or_referral(self):
+        self.assertEqual(normalize_ga4_channel("smartpush", "email", "Email"), "SmartPush")
+        self.assertEqual(normalize_ga4_channel("wangao", "wangao", "Referral"), "SmartPush")
+        self.assertEqual(normalize_ga4_channel("newsletter", "email", "Email"), "Email")
+        self.assertEqual(
+            normalize_ga4_channel("sl_smartads", "facebook", "Paid Social"),
+            "Facebook",
+        )
 
     def test_ga4_status_exposes_live_purchase_diagnostics(self):
         status = build_ga4_status(
@@ -365,6 +438,7 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(normalize_marketing_source("Google Ads"), "Google")
         self.assertEqual(normalize_marketing_source("tt"), "TikTok")
         self.assertEqual(normalize_marketing_source("newsletter"), "Email")
+        self.assertEqual(normalize_marketing_source("smartpush"), "SmartPush")
         self.assertEqual(normalize_marketing_source("organic"), "Organic")
         self.assertEqual(normalize_marketing_source("ad"), "Ad")
         self.assertEqual(normalize_marketing_source("Shopline"), "Direct")
@@ -630,9 +704,12 @@ class BackendTests(unittest.TestCase):
             "https://jp-sosove.myshopline.com/admin/openapi/v20260301",
         )
         self.assertEqual(config.orders_path, "/orders.json")
+        self.assertEqual(config.attribution_path, "/orders/order_attribution_info.json")
         self.assertEqual(config.products_path, "/products/products.json")
         self.assertEqual(config.default_currency, "JPY")
         self.assertEqual(config.timezone_name, "Asia/Tokyo")
+        self.assertEqual(config.timeout_seconds, 30)
+        self.assertEqual(config.retry_attempts, 3)
 
     def test_order_query_params_include_any_status_and_recent_sort(self):
         params = build_order_query_params(date(2026, 6, 11), date(2026, 6, 17), limit=500)
@@ -643,6 +720,38 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(params["sort_condition"], "order_at:desc")
         self.assertTrue(params["created_at_min"].startswith("2026-06-11T00:00:00"))
         self.assertTrue(params["created_at_max"].startswith("2026-06-17T23:59:59"))
+
+    def test_shopline_request_retries_transient_timeout(self):
+        class FakeResponse:
+            headers = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return b'{"orders":[]}'
+
+        client = ShoplineClient(
+            ShoplineConfig(
+                base_url="https://store.example/admin/openapi/v20260301",
+                access_token="token-value",
+                orders_path="/orders.json",
+                retry_attempts=2,
+            )
+        )
+        with patch(
+            "shopline_monitor.backend.urllib.request.urlopen",
+            side_effect=[TimeoutError("read timed out"), FakeResponse()],
+        ) as urlopen, patch("shopline_monitor.backend.time_module.sleep") as sleep:
+            payload, headers = client.request_json_with_headers("/orders.json")
+
+        self.assertEqual(payload, {"orders": []})
+        self.assertEqual(headers, {})
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once()
 
     def test_load_orders_uses_shopline_recent_order_query(self):
         class RecordingClient(ShoplineClient):
@@ -671,6 +780,117 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(client.seen_params["sort_condition"], "order_at:desc")
         self.assertTrue(client.seen_params["created_at_min"].startswith("2026-06-11"))
         self.assertTrue(client.seen_params["created_at_max"].startswith("2026-06-17"))
+
+    def test_live_order_failure_never_injects_sample_orders(self):
+        class FailingClient(ShoplineClient):
+            def __init__(self):
+                super().__init__(
+                    ShoplineConfig(
+                        base_url="https://store.example/admin/openapi/v20260301",
+                        access_token="token-value",
+                        orders_path="/orders.json",
+                    )
+                )
+
+            def request_json_with_headers(self, path, params=None):
+                raise TimeoutError("read timed out")
+
+        result = FailingClient().load_orders(1, today=date(2026, 6, 17))
+
+        self.assertEqual(result["source"], "error")
+        self.assertEqual(result["items"], [])
+        self.assertEqual(result["normalizedCount"], 0)
+        self.assertIn("实时订单拉取失败", result["error"])
+
+    def test_live_order_failure_keeps_last_successful_real_data(self):
+        clear_data_cache()
+        client = ShoplineClient(
+            ShoplineConfig(
+                base_url="https://store.example/admin/openapi/v20260301",
+                access_token="token-value",
+                orders_path="/orders.json",
+            )
+        )
+        payload = {
+            "orders": [
+                {
+                    "order_id": "smartpush-live-1",
+                    "created_at": "2026-06-17T09:20:36+08:00",
+                    "total_price": "8430",
+                    "source_name": "smartpush",
+                }
+            ]
+        }
+        with patch.object(client, "request_json_with_headers", return_value=(payload, {})):
+            first = client.load_orders(1, today=date(2026, 6, 17))
+
+        clear_live_data_cache(date(2026, 6, 17))
+        with patch.object(
+            client,
+            "request_json_with_headers",
+            side_effect=TimeoutError("read timed out"),
+        ):
+            fallback = client.load_orders(1, today=date(2026, 6, 17))
+
+        self.assertEqual(first["source"], "live")
+        self.assertEqual(fallback["source"], "stale")
+        self.assertEqual(fallback["items"], first["items"])
+        self.assertTrue(fallback["stale"])
+        self.assertIn("上次成功数据", fallback["error"])
+        clear_data_cache()
+
+    def test_live_refresh_reuses_historical_order_windows(self):
+        clear_data_cache()
+        client = ShoplineClient(
+            ShoplineConfig(
+                base_url="https://store.example/admin/openapi/v20260301",
+                access_token="token-value",
+                orders_path="/orders.json",
+            )
+        )
+        with patch.dict(os.environ, {"SHOPLINE_ORDER_CHUNK_DAYS": "7"}), patch.object(
+            client,
+            "request_json_with_headers",
+            return_value=({"orders": []}, {}),
+        ) as request:
+            first = client.load_orders(30, today=date(2026, 6, 30))
+            clear_live_data_cache(date(2026, 6, 30))
+            second = client.load_orders(30, today=date(2026, 6, 30))
+
+        self.assertEqual(first["chunks"], 5)
+        self.assertEqual(first["windowCacheHits"], 0)
+        self.assertEqual(second["windowCacheHits"], 4)
+        self.assertEqual(request.call_count, 6)
+        clear_data_cache()
+
+    def test_channel_analytics_exposes_official_smartpush_reconciliation(self):
+        orders = [
+            {
+                "source": "SmartPush",
+                "total": 8430,
+                "units": 1,
+                "attributionMethod": "shopline_attribution",
+            },
+            {
+                "source": "Facebook",
+                "total": 6980,
+                "units": 1,
+                "attributionMethod": "utm",
+            },
+        ]
+
+        channels = build_channels(orders)
+        analytics = build_channel_analytics(orders, channels)
+        grouped = {row["channel"]: row for row in channels}
+
+        self.assertEqual(grouped["SmartPush"]["officialOrders"], 1)
+        self.assertEqual(grouped["SmartPush"]["inferredOrders"], 0)
+        self.assertEqual(grouped["SmartPush"]["orderDetailCount"], 1)
+        self.assertEqual(grouped["SmartPush"]["orderDetails"][0]["total"], 8430)
+        self.assertEqual(analytics["officialOrders"], 1)
+        self.assertEqual(analytics["officialAttributionRate"], 50)
+        self.assertEqual(analytics["smartPushOrders"], 1)
+        self.assertEqual(analytics["smartPushRevenue"], 8430)
 
     def test_load_orders_follows_shopline_next_page_link(self):
         class PagingClient(ShoplineClient):
@@ -718,6 +938,60 @@ class BackendTests(unittest.TestCase):
 
         self.assertEqual([order["id"] for order in result["items"]], ["1001", "1002"])
         self.assertEqual(client.seen_params[1], {"limit": "100", "page_info": "next-1"})
+
+    def test_load_orders_enriches_rows_with_bulk_order_attribution(self):
+        class AttributionClient(ShoplineClient):
+            def __init__(self):
+                super().__init__(
+                    ShoplineConfig(
+                        base_url="https://store.example/admin/openapi/v20260301",
+                        access_token="token-value",
+                        orders_path="/orders.json",
+                        attribution_path="/orders/order_attribution_info.json",
+                    )
+                )
+                self.attribution_payload = None
+
+            def request_json_with_headers(self, path, params=None):
+                return (
+                    {
+                        "orders": [
+                            {
+                                "order_id": "1001",
+                                "created_at": "2026-06-17T09:20:36+08:00",
+                                "total_price": "100",
+                            }
+                        ]
+                    },
+                    {},
+                )
+
+            def post_json_with_headers(self, path, payload):
+                self.attribution_payload = payload
+                return (
+                    {
+                        "data": [
+                            {
+                                "order_seq": "1001",
+                                "last_interaction": {
+                                    "last_interaction_source": "Other",
+                                    "last_referrer_name": "smartpush",
+                                    "last_utm_parameters": {},
+                                },
+                            }
+                        ]
+                    },
+                    {},
+                )
+
+        client = AttributionClient()
+        result = client.load_orders(7, today=date(2026, 6, 17))
+
+        self.assertEqual(client.attribution_payload, {"orders": ["1001"]})
+        self.assertEqual(result["items"][0]["source"], "SmartPush")
+        self.assertEqual(result["attributionRequested"], 1)
+        self.assertEqual(result["attributionCount"], 1)
+        self.assertIsNone(result["attributionError"])
 
     def test_next_page_info_from_link_header(self):
         link = (

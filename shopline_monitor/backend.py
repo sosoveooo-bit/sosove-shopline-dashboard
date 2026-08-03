@@ -35,6 +35,8 @@ DEFAULT_GA4_KEY_EVENT_NAME = "purchase"
 DEFAULT_GA4_CONVERSION_METRIC = "userKeyEventRate"
 DEFAULT_GA4_CONVERSION_MODE = "key_event_rate"
 DEFAULT_DASHBOARD_CACHE_SECONDS = 180
+DEFAULT_SHOPLINE_TIMEOUT_SECONDS = 30.0
+DEFAULT_SHOPLINE_RETRY_ATTEMPTS = 3
 GA4_READONLY_SCOPE = "https://www.googleapis.com/auth/analytics.readonly"
 CLICK_ID_KEYS = (
     "gclid",
@@ -107,11 +109,11 @@ UTM_MEDIUM_VALUES = {
     "social",
 }
 CLICK_SOURCE_EXPECTATIONS = {
-    "gclid": {"Google"},
-    "dclid": {"Google"},
-    "wbraid": {"Google"},
-    "gbraid": {"Google"},
-    "gad_source": {"Google"},
+    "gclid": {"Google", "Google Ads"},
+    "dclid": {"Google", "Google Ads"},
+    "wbraid": {"Google", "Google Ads"},
+    "gbraid": {"Google", "Google Ads"},
+    "gad_source": {"Google", "Google Ads"},
     "fbclid": {"Facebook", "Instagram"},
     "ttclid": {"TikTok"},
     "msclkid": {"Bing"},
@@ -122,6 +124,7 @@ TRAFFIC_SOURCE_BUCKETS = {
     "Facebook",
     "Instagram",
     "Google",
+    "Google Ads",
     "TikTok",
     "YouTube",
     "LINE",
@@ -130,6 +133,7 @@ TRAFFIC_SOURCE_BUCKETS = {
     "Bing",
     "Yahoo",
     "Email",
+    "SmartPush",
     "SMS / Push",
     "AI / Chat",
     "Direct",
@@ -143,6 +147,7 @@ TRAFFIC_SOURCE_BUCKETS = {
 _DASHBOARD_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _DASHBOARD_CACHE_LOCK = threading.Lock()
 _DATA_CACHE: dict[str, tuple[float, Any]] = {}
+_LAST_GOOD_DATA: dict[str, tuple[float, Any]] = {}
 _DATA_CACHE_LOCK = threading.Lock()
 _CLICK_CAMPAIGN_MAP_CACHE: tuple[str, dict[str, dict[str, str]]] = ("", {})
 
@@ -176,10 +181,12 @@ class ShoplineConfig:
     access_token: str = ""
     store_domain: str = ""
     orders_path: str = ""
+    attribution_path: str = ""
     products_path: str = ""
     token_header: str = "Authorization"
     auth_prefix: str = "Bearer"
-    timeout_seconds: float = 12.0
+    timeout_seconds: float = DEFAULT_SHOPLINE_TIMEOUT_SECONDS
+    retry_attempts: int = DEFAULT_SHOPLINE_RETRY_ATTEMPTS
     default_currency: str = DEFAULT_CURRENCY
     timezone_name: str = DEFAULT_TIMEZONE
     conversion_traffic_field: str = DEFAULT_CONVERSION_TRAFFIC_FIELD
@@ -187,13 +194,22 @@ class ShoplineConfig:
 
     @classmethod
     def from_env(cls) -> "ShoplineConfig":
-        timeout_raw = os.getenv("SHOPLINE_TIMEOUT_SECONDS", "12")
+        timeout_raw = os.getenv(
+            "SHOPLINE_TIMEOUT_SECONDS", str(DEFAULT_SHOPLINE_TIMEOUT_SECONDS)
+        )
+        retry_attempts_raw = os.getenv(
+            "SHOPLINE_RETRY_ATTEMPTS", str(DEFAULT_SHOPLINE_RETRY_ATTEMPTS)
+        )
         max_order_pages_raw = os.getenv("SHOPLINE_MAX_ORDER_PAGES", str(DEFAULT_MAX_ORDER_PAGES))
         api_version = os.getenv("SHOPLINE_API_VERSION", DEFAULT_API_VERSION).strip() or DEFAULT_API_VERSION
         try:
             timeout = max(1.0, float(timeout_raw))
         except ValueError:
-            timeout = 12.0
+            timeout = DEFAULT_SHOPLINE_TIMEOUT_SECONDS
+        try:
+            retry_attempts = max(1, min(5, int(retry_attempts_raw)))
+        except ValueError:
+            retry_attempts = DEFAULT_SHOPLINE_RETRY_ATTEMPTS
         try:
             max_order_pages = max(1, min(25, int(max_order_pages_raw)))
         except ValueError:
@@ -201,6 +217,10 @@ class ShoplineConfig:
 
         raw_base_url = os.getenv("SHOPLINE_API_BASE_URL", "").strip()
         raw_orders_path = os.getenv("SHOPLINE_ORDERS_ENDPOINT", "").strip()
+        raw_attribution_path = os.getenv(
+            "SHOPLINE_ORDER_ATTRIBUTION_ENDPOINT",
+            "/orders/order_attribution_info.json",
+        ).strip()
         raw_products_path = os.getenv("SHOPLINE_PRODUCTS_ENDPOINT", "").strip()
 
         return cls(
@@ -208,11 +228,13 @@ class ShoplineConfig:
             access_token=os.getenv("SHOPLINE_ACCESS_TOKEN", "").strip(),
             store_domain=os.getenv("SHOPLINE_STORE_DOMAIN", "").strip(),
             orders_path=normalize_endpoint_path(raw_orders_path, "orders"),
+            attribution_path=normalize_endpoint_path(raw_attribution_path, "order_attribution"),
             products_path=normalize_endpoint_path(raw_products_path, "products"),
             token_header=os.getenv("SHOPLINE_TOKEN_HEADER", "Authorization").strip()
             or "Authorization",
             auth_prefix=os.getenv("SHOPLINE_AUTH_PREFIX", "Bearer").strip(),
             timeout_seconds=timeout,
+            retry_attempts=retry_attempts,
             default_currency=(
                 os.getenv("SHOPLINE_DEFAULT_CURRENCY", DEFAULT_CURRENCY).strip()
                 or DEFAULT_CURRENCY
@@ -341,6 +363,7 @@ class ShoplineClient:
             "baseUrl": mask_url(self.config.base_url),
             "storeDomain": self.config.store_domain,
             "ordersEndpoint": self.config.orders_path,
+            "orderAttributionEndpoint": self.config.attribution_path,
             "productsEndpoint": self.config.products_path,
             "tokenHeader": self.config.token_header,
             "tokenPreview": mask_secret(self.config.access_token),
@@ -349,6 +372,8 @@ class ShoplineClient:
             "trafficConfigured": bool(load_traffic_from_env()),
             "conversionTrafficField": self.config.conversion_traffic_field,
             "maxOrderPages": self.config.max_order_pages,
+            "requestTimeoutSeconds": self.config.timeout_seconds,
+            "retryAttempts": self.config.retry_attempts,
             "clickCampaignMapCount": len(load_click_campaign_map_from_env()),
             "missing": missing,
             "ga4": {
@@ -376,6 +401,9 @@ class ShoplineClient:
                 "duplicateCount": 0,
                 "chunks": 1,
                 "pageLimitReached": False,
+                "attributionRequested": 0,
+                "attributionCount": 0,
+                "attributionError": None,
             }
 
         start = today - timedelta(days=max(days - 1, 0))
@@ -392,13 +420,24 @@ class ShoplineClient:
                     max_workers=min(4, len(windows)),
                     thread_name_prefix="shopline-chunk",
                 ) as pool:
-                    chunks = list(pool.map(lambda window: self._load_order_window(*window), windows))
+                    chunks = list(
+                        pool.map(lambda window: self._load_order_window_cached(*window), windows)
+                    )
             else:
-                chunks = [self._load_order_window(start, today)]
+                chunks = [self._load_order_window_cached(start, today)]
             orders = [order for chunk in chunks for order in chunk["orders"]]
             pages = sum(int(chunk["pages"]) for chunk in chunks)
             raw_count = sum(int(chunk["rawCount"]) for chunk in chunks)
             page_limit_reached = any(bool(chunk["pageLimitReached"]) for chunk in chunks)
+            attribution_requested = sum(int(chunk["attributionRequested"]) for chunk in chunks)
+            attribution_count = sum(int(chunk["attributionCount"]) for chunk in chunks)
+            attribution_errors = list(
+                dict.fromkeys(
+                    str(chunk["attributionError"])
+                    for chunk in chunks
+                    if chunk.get("attributionError")
+                )
+            )
             unique_orders, duplicate_count = deduplicate_orders(orders)
             result = {
                 "items": unique_orders,
@@ -409,51 +448,136 @@ class ShoplineClient:
                 "normalizedCount": len(unique_orders),
                 "duplicateCount": duplicate_count,
                 "chunks": len(windows),
+                "windowCacheHits": sum(bool(chunk.get("cacheHit")) for chunk in chunks),
                 "pageLimitReached": page_limit_reached,
+                "attributionRequested": attribution_requested,
+                "attributionCount": attribution_count,
+                "attributionError": " | ".join(attribution_errors) or None,
                 "cached": False,
             }
             if use_cache:
                 set_data_cache(cache_key, result)
             return result
         except Exception as exc:  # pragma: no cover - network-specific branch
-            items = sample_orders(days, today=today, currency=self.config.default_currency)
+            error = f"{exc.__class__.__name__}: {exc}"
+            stale = get_last_good_data(cache_key) if use_cache else None
+            if stale is not None:
+                stale.update(
+                    {
+                        "source": "stale",
+                        "error": f"Shopline 实时刷新失败，已保留上次成功数据：{error}",
+                        "cached": True,
+                        "stale": True,
+                    }
+                )
+                return stale
             return {
-                "items": items,
-                "source": "sample",
-                "error": f"{exc.__class__.__name__}: {exc}",
+                "items": [],
+                "source": "error",
+                "error": f"Shopline 实时订单拉取失败：{error}",
                 "pages": 0,
                 "rawCount": 0,
-                "normalizedCount": len(items),
+                "normalizedCount": 0,
                 "duplicateCount": 0,
                 "chunks": 0,
+                "windowCacheHits": 0,
                 "pageLimitReached": False,
+                "attributionRequested": 0,
+                "attributionCount": 0,
+                "attributionError": None,
+                "cached": False,
+                "stale": False,
             }
+
+    def _load_order_window_cached(self, start: date, end: date) -> dict[str, Any]:
+        cache_key = (
+            f"shopline:order-window:{self.config.base_url}:"
+            f"{start.isoformat()}:{end.isoformat()}"
+        )
+        use_cache = type(self) is ShoplineClient
+        cached = get_data_cache(cache_key) if use_cache else None
+        if cached is not None:
+            cached["cacheHit"] = True
+            return cached
+        result = self._load_order_window(start, end)
+        result["cacheHit"] = False
+        if use_cache:
+            set_data_cache(cache_key, result)
+        return result
 
     def _load_order_window(self, start: date, end: date) -> dict[str, Any]:
         params = build_order_query_params(start, end, timezone_name=self.config.timezone_name)
-        orders: list[dict[str, Any]] = []
+        raw_orders: list[dict[str, Any]] = []
         seen_page_info: set[str] = set()
         pages = 0
         raw_count = 0
         has_next_page = False
         for _ in range(self.config.max_order_pages):
             payload, headers = self.request_json_with_headers(self.config.orders_path, params=params)
-            page_orders = normalize_shopline_orders(payload, self.config.default_currency)
+            page_orders = [
+                order
+                for order in extract_collection(
+                    payload,
+                    ["orders", "order_list", "items", "data", "results"],
+                )
+                if isinstance(order, dict)
+            ]
             pages += 1
             raw_count += len(page_orders)
-            orders.extend(page_orders)
+            raw_orders.extend(page_orders)
             page_info = next_page_info_from_link(headers.get("Link") or headers.get("link", ""))
             has_next_page = bool(page_info)
             if not page_info or page_info in seen_page_info:
                 break
             seen_page_info.add(page_info)
             params = {"limit": str(ORDER_PAGE_LIMIT), "page_info": page_info}
+
+        order_ids = list(
+            dict.fromkeys(
+                order_id
+                for index, order in enumerate(raw_orders, start=1)
+                if (order_id := extract_raw_order_id(order, index))
+            )
+        )
+        attribution_by_order_id: dict[str, dict[str, Any]] = {}
+        attribution_error: str | None = None
+        if self.config.attribution_path and order_ids:
+            try:
+                attribution_by_order_id = self.load_order_attribution(order_ids)
+            except Exception as exc:  # pragma: no cover - network-specific branch
+                attribution_error = f"Shopline attribution {exc.__class__.__name__}: {exc}"
+
+        orders = normalize_shopline_orders(
+            {"orders": raw_orders},
+            self.config.default_currency,
+            attribution_by_order_id=attribution_by_order_id,
+        )
         return {
             "orders": orders,
             "pages": pages,
             "rawCount": raw_count,
             "pageLimitReached": has_next_page and pages >= self.config.max_order_pages,
+            "attributionRequested": len(order_ids),
+            "attributionCount": len(attribution_by_order_id),
+            "attributionError": attribution_error,
         }
+
+    def load_order_attribution(self, order_ids: list[str]) -> dict[str, dict[str, Any]]:
+        unique_ids = list(dict.fromkeys(str(order_id).strip() for order_id in order_ids if str(order_id).strip()))
+        attribution_by_order_id: dict[str, dict[str, Any]] = {}
+        for offset in range(0, len(unique_ids), 500):
+            payload, _ = self.post_json_with_headers(
+                self.config.attribution_path,
+                {"orders": unique_ids[offset : offset + 500]},
+            )
+            rows = extract_collection(payload, ["data", "orders", "items", "results"])
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                order_id = str(pick(row, "order_seq", "order_id", "id", default="") or "").strip()
+                if order_id:
+                    attribution_by_order_id[order_id] = row
+        return attribution_by_order_id
 
     def load_products(self, today: date | None = None) -> dict[str, Any]:
         today = today or current_dashboard_date(self.config.timezone_name)
@@ -486,12 +610,25 @@ class ShoplineClient:
                 set_data_cache(cache_key, result)
             return result
         except Exception as exc:  # pragma: no cover - network-specific branch
-            items = sample_products(today=today, currency=self.config.default_currency)
+            error = f"{exc.__class__.__name__}: {exc}"
+            stale = get_last_good_data(cache_key) if use_cache else None
+            if stale is not None:
+                stale.update(
+                    {
+                        "source": "stale",
+                        "error": f"Shopline 商品刷新失败，已保留上次成功数据：{error}",
+                        "cached": True,
+                        "stale": True,
+                    }
+                )
+                return stale
             return {
-                "items": items,
-                "source": "sample",
-                "error": f"{exc.__class__.__name__}: {exc}",
-                "rawCount": len(items),
+                "items": [],
+                "source": "error",
+                "error": f"Shopline 商品拉取失败：{error}",
+                "rawCount": 0,
+                "cached": False,
+                "stale": False,
             }
 
     def request_json(self, path: str, params: dict[str, str] | None = None) -> Any:
@@ -504,6 +641,48 @@ class ShoplineClient:
         params: dict[str, str] | None = None,
     ) -> tuple[Any, dict[str, str]]:
         url = build_url(self.config.base_url, path, params=params)
+        return self._open_json_with_retry(
+            lambda: urllib.request.Request(url, headers=self.request_headers(), method="GET")
+        )
+
+    def post_json_with_headers(
+        self,
+        path: str,
+        payload: dict[str, Any],
+    ) -> tuple[Any, dict[str, str]]:
+        url = build_url(self.config.base_url, path)
+        encoded_payload = json.dumps(payload).encode("utf-8")
+        return self._open_json_with_retry(
+            lambda: urllib.request.Request(
+                url,
+                data=encoded_payload,
+                headers=self.request_headers(),
+                method="POST",
+            )
+        )
+
+    def _open_json_with_retry(self, request_factory: Any) -> tuple[Any, dict[str, str]]:
+        attempts = max(1, int(self.config.retry_attempts))
+        for attempt in range(attempts):
+            try:
+                request = request_factory()
+                with urllib.request.urlopen(
+                    request, timeout=self.config.timeout_seconds
+                ) as response:
+                    raw = response.read().decode("utf-8")
+                    return json.loads(raw), dict(response.headers.items())
+            except urllib.error.HTTPError as exc:
+                retryable = exc.code == 429 or 500 <= exc.code < 600
+                if not retryable or attempt + 1 >= attempts:
+                    raise
+            except (TimeoutError, ConnectionError, urllib.error.URLError):
+                if attempt + 1 >= attempts:
+                    raise
+            time_module.sleep(min(0.5 * (2**attempt), 2.0))
+
+        raise RuntimeError("Shopline request retry loop exited unexpectedly")
+
+    def request_headers(self) -> dict[str, str]:
         headers = {
             "Accept": "application/json",
             "Content-Type": "application/json; charset=utf-8",
@@ -515,11 +694,7 @@ class ShoplineClient:
             headers[self.config.token_header] = token
         if self.config.store_domain:
             headers["X-Shopline-Store-Domain"] = self.config.store_domain
-
-        request = urllib.request.Request(url, headers=headers, method="GET")
-        with urllib.request.urlopen(request, timeout=self.config.timeout_seconds) as response:
-            raw = response.read().decode("utf-8")
-            return json.loads(raw), dict(response.headers.items())
+        return headers
 
     def test_connection(self) -> dict[str, Any]:
         if not self.config.live_ready:
@@ -738,8 +913,11 @@ def build_dashboard_payload(
         error
         for error in (
             current_orders_result.get("error"),
+            current_orders_result.get("attributionError"),
             previous_orders_result.get("error"),
+            previous_orders_result.get("attributionError"),
             year_orders_result.get("error"),
+            year_orders_result.get("attributionError"),
             products_result.get("error"),
             ga4_lookback.error,
             ga4_current.error,
@@ -863,6 +1041,10 @@ def source_mode_from_results(*results: dict[str, Any]) -> str:
     sources = {result.get("source") for result in results}
     if sources == {"live"}:
         return "live"
+    if "stale" in sources:
+        return "stale"
+    if sources == {"error"}:
+        return "error"
     if "live" in sources:
         return "mixed"
     return "sample"
@@ -871,6 +1053,8 @@ def source_mode_from_results(*results: dict[str, Any]) -> str:
 def source_label(mode: str) -> str:
     return {
         "live": "实时接口数据",
+        "stale": "上次成功的真实数据",
+        "error": "实时接口暂不可用",
         "mixed": "混合数据",
         "sample": "示例数据",
     }.get(mode, "示例数据")
@@ -948,18 +1132,29 @@ def get_data_cache(key: str) -> Any | None:
 
 
 def set_data_cache(key: str, value: Any) -> None:
-    if dashboard_cache_seconds() <= 0:
-        return
+    created_at = time_module.monotonic()
     with _DATA_CACHE_LOCK:
-        _DATA_CACHE[key] = (time_module.monotonic(), copy.deepcopy(value))
-        if len(_DATA_CACHE) > 128:
-            oldest_key = min(_DATA_CACHE, key=lambda item: _DATA_CACHE[item][0])
-            _DATA_CACHE.pop(oldest_key, None)
+        _LAST_GOOD_DATA[key] = (created_at, copy.deepcopy(value))
+        if dashboard_cache_seconds() > 0:
+            _DATA_CACHE[key] = (created_at, copy.deepcopy(value))
+            if len(_DATA_CACHE) > 128:
+                oldest_key = min(_DATA_CACHE, key=lambda item: _DATA_CACHE[item][0])
+                _DATA_CACHE.pop(oldest_key, None)
+        if len(_LAST_GOOD_DATA) > 128:
+            oldest_key = min(_LAST_GOOD_DATA, key=lambda item: _LAST_GOOD_DATA[item][0])
+            _LAST_GOOD_DATA.pop(oldest_key, None)
+
+
+def get_last_good_data(key: str) -> Any | None:
+    with _DATA_CACHE_LOCK:
+        cached = _LAST_GOOD_DATA.get(key)
+        return copy.deepcopy(cached[1]) if cached else None
 
 
 def clear_data_cache() -> None:
     with _DATA_CACHE_LOCK:
         _DATA_CACHE.clear()
+        _LAST_GOOD_DATA.clear()
 
 
 def clear_live_data_cache(today: date) -> None:
@@ -1080,14 +1275,31 @@ def calculate_conversion_rate(
 def normalize_shopline_orders(
     payload: Any,
     default_currency: str = DEFAULT_CURRENCY,
+    attribution_by_order_id: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     default_currency = (default_currency or DEFAULT_CURRENCY).upper()
+    attribution_by_order_id = attribution_by_order_id or {}
     records = extract_collection(payload, ["orders", "order_list", "items", "data", "results"])
     orders = []
     for index, record in enumerate(records, start=1):
         if isinstance(record, dict):
-            orders.append(normalize_order(record, index, default_currency))
+            order_id = extract_raw_order_id(record, index)
+            orders.append(
+                normalize_order(
+                    record,
+                    index,
+                    default_currency,
+                    attribution_info=attribution_by_order_id.get(order_id),
+                )
+            )
     return orders
+
+
+def extract_raw_order_id(order: dict[str, Any], index: int = 0) -> str:
+    fallback = f"sample-{index}" if index else ""
+    return str(
+        pick(order, "id", "order_id", "orderNo", "order_no", "name", default=fallback) or fallback
+    ).strip()
 
 
 def deduplicate_orders(orders: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
@@ -1122,6 +1334,7 @@ def normalize_order(
     order: dict[str, Any],
     index: int,
     default_currency: str = DEFAULT_CURRENCY,
+    attribution_info: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     customer_profile = normalize_customer_profile(order)
     line_items = pick(order, "line_items", "items", "products", "order_items", default=[])
@@ -1174,7 +1387,8 @@ def normalize_order(
         )
     ) or current_dashboard_date()
 
-    attribution = extract_order_attribution(order)
+    official_tracking = extract_shopline_attribution_tracking(attribution_info)
+    attribution = extract_order_attribution(order, attribution_info=attribution_info)
     click_ids = extract_order_click_ids(order)
     click_campaign = resolve_click_campaign_mapping(click_ids)
     source_campaign_id = (
@@ -1189,7 +1403,7 @@ def normalize_order(
 
     return {
         "id": str(
-            pick(order, "id", "order_id", "orderNo", "order_no", "name", default=f"sample-{index}")
+            extract_raw_order_id(order, index)
         ),
         "createdAt": order_date.isoformat(),
         "total": round_number(total),
@@ -1204,14 +1418,14 @@ def normalize_order(
         ),
         "source": attribution["source"],
         "sourceRaw": attribution["raw"] or attribution["source"],
-        "sourceUtm": tracking_value(order, "utm_source"),
+        "sourceUtm": official_tracking.get("utm_source") or tracking_value(order, "utm_source"),
         "sourceMedium": attribution["medium"],
         "sourceCampaign": source_campaign,
         "sourceCampaignId": source_campaign_id,
         "sourceAdset": tracking_value(order, "utm_adset", "adset_id", "sl_source_adset_id"),
         "sourceAd": tracking_value(order, "utm_ad", "ad_id", "utm_term", "sl_source_ad_id"),
-        "sourceContent": tracking_value(order, "utm_content", "content"),
-        "sourceTerm": tracking_value(order, "utm_term", "term"),
+        "sourceContent": official_tracking.get("utm_content") or tracking_value(order, "utm_content", "content"),
+        "sourceTerm": official_tracking.get("utm_term") or tracking_value(order, "utm_term", "term"),
         "clickIds": click_ids,
         "clickCampaignMapped": bool(click_campaign),
         "attributionMethod": attribution["method"],
@@ -1378,9 +1592,11 @@ def normalize_marketing_source(source: Any) -> str:
         return "Bing"
     if "yahoo" in compact:
         return "Yahoo"
+    if "smartpush" in compact or "smart push" in compact:
+        return "SmartPush"
     if "email" in compact or "newsletter" in compact or "edm" in tokens:
         return "Email"
-    if any(label in compact for label in ("sms", "smartpush", "web push", "notification")):
+    if any(label in compact for label in ("sms", "web push", "notification")):
         return "SMS / Push"
     if any(label in compact for label in ("chatgpt", "openai", "perplexity", "gemini", "copilot")):
         return "AI / Chat"
@@ -1398,6 +1614,14 @@ def normalize_marketing_source(source: Any) -> str:
     return raw[:1].upper() + raw[1:] if raw[:1].islower() else raw
 
 
+def normalize_shopline_attribution_source(source: Any) -> str:
+    raw = str(source or "").strip()
+    compact = re.sub(r"[\s\-_./]+", "", raw.lower())
+    if compact == "googleads":
+        return "Google Ads"
+    return normalize_marketing_source(raw)
+
+
 def normalize_phone_key(phone: str) -> str:
     digits = re.sub(r"\D+", "", str(phone or ""))
     return digits[-12:] if digits else ""
@@ -1408,8 +1632,102 @@ def extract_order_traffic_source(order: dict[str, Any]) -> tuple[str, str]:
     return attribution["source"], attribution["raw"]
 
 
-def extract_order_attribution(order: dict[str, Any]) -> dict[str, str]:
+def extract_shopline_attribution_tracking(
+    attribution_info: dict[str, Any] | None,
+) -> dict[str, str]:
+    if not isinstance(attribution_info, dict):
+        return {}
+    interaction = first_dict(
+        attribution_info.get("last_interaction"),
+        attribution_info.get("lastInteraction"),
+        attribution_info,
+    )
+    parameters = first_dict(
+        interaction.get("last_utm_parameters"),
+        interaction.get("lastUtmParameters"),
+    )
+    candidates = {
+        "utm_source": ("last_utm_source", "lastUtmSource", "utm_source"),
+        "utm_medium": ("last_utm_medium", "lastUtmMedium", "utm_medium"),
+        "utm_campaign": (
+            "last_utm_campaign",
+            "lastUtmCampaign",
+            "last_utm_name",
+            "lastUtmName",
+            "utm_campaign",
+        ),
+        "utm_content": ("last_utm_content", "lastUtmContent", "utm_content"),
+        "utm_term": ("last_utm_term", "lastUtmTerm", "utm_term"),
+    }
+    tracking: dict[str, str] = {}
+    for key, source_keys in candidates.items():
+        value = str(pick(parameters, *source_keys, default="") or "").strip()
+        if value:
+            tracking[key] = value
+    return tracking
+
+
+def extract_shopline_last_touch_attribution(
+    attribution_info: dict[str, Any] | None,
+) -> dict[str, str] | None:
+    if not isinstance(attribution_info, dict):
+        return None
+    interaction = first_dict(
+        attribution_info.get("last_interaction"),
+        attribution_info.get("lastInteraction"),
+    )
+    if not interaction:
+        return None
+
+    source_name = str(
+        pick(interaction, "last_referrer_name", "lastReferrerName", default="") or ""
+    ).strip()
+    source_url = str(
+        pick(interaction, "last_referrer_url", "lastReferrerUrl", default="") or ""
+    ).strip()
+    landing_page = str(
+        pick(interaction, "last_landing_page", "lastLandingPage", default="") or ""
+    ).strip()
+    interaction_type = str(
+        pick(interaction, "last_interaction_source", "lastInteractionSource", default="") or ""
+    ).strip()
+    tracking = extract_shopline_attribution_tracking(attribution_info)
+
+    source = normalize_shopline_attribution_source(source_name) if source_name else ""
+    if source not in TRAFFIC_SOURCE_BUCKETS:
+        source = infer_traffic_source_from_url(source_url or landing_page)
+    if source not in TRAFFIC_SOURCE_BUCKETS:
+        source = normalize_marketing_source(
+            f"{tracking.get('utm_source', '')} {tracking.get('utm_medium', '')}".strip()
+        )
+    if source not in TRAFFIC_SOURCE_BUCKETS:
+        source = {
+            "direct": "Direct",
+            "search": "Organic",
+            "social": "Referral",
+            "other": "Other",
+            "ai chat": "AI / Chat",
+        }.get(interaction_type.lower(), "Other")
+
+    return attribution_result(
+        source,
+        source_name or source_url or landing_page or source,
+        tracking.get("utm_medium", ""),
+        tracking.get("utm_campaign", ""),
+        "shopline_attribution",
+        "high",
+    )
+
+
+def extract_order_attribution(
+    order: dict[str, Any],
+    attribution_info: dict[str, Any] | None = None,
+) -> dict[str, str]:
     """Resolve last-touch attribution from Shopline's flat, JSON and URL fields."""
+    official_attribution = extract_shopline_last_touch_attribution(attribution_info)
+    if official_attribution:
+        return official_attribution
+
     source_url = str(pick(order, "source_url", default="") or "").strip()
     referring_site = str(pick(order, "referring_site", default="") or "").strip()
     landing_site = str(pick(order, "landing_site", default="") or "").strip()
@@ -2411,6 +2729,9 @@ def normalize_ga4_channel(source: Any, medium: Any, group: Any) -> str:
 
     if is_internal_store_host(source_text):
         return "Direct"
+    source_key = re.sub(r"[\s._/-]+", "", source_text.lower())
+    if source_key in {"smartpush", "wangao"}:
+        return "SmartPush"
     if source_text.lower().startswith("igshopping"):
         return "Instagram"
 
@@ -3060,6 +3381,21 @@ def build_channels(
         bucket["orders"] += 1
         bucket["revenue"] += float(order.get("total", 0))
         bucket["units"] += int(order.get("units", 0))
+        if order.get("attributionMethod") == "shopline_attribution":
+            bucket["officialOrders"] += 1
+        bucket["orderDetails"].append(
+            {
+                "id": str(order.get("id") or ""),
+                "createdAt": str(order.get("createdAt") or ""),
+                "total": round_number(float(order.get("total") or 0)),
+                "status": str(order.get("status") or ""),
+                "utmSource": str(order.get("sourceUtm") or ""),
+                "utmMedium": str(order.get("sourceMedium") or ""),
+                "campaign": str(order.get("sourceCampaign") or ""),
+                "attributionMethod": str(order.get("attributionMethod") or ""),
+                "attributionConfidence": str(order.get("attributionConfidence") or ""),
+            }
+        )
         utm_values = {
             "source": str(order.get("sourceUtm") or "").strip(),
             "medium": str(order.get("sourceMedium") or "").strip(),
@@ -3117,10 +3453,19 @@ def build_channels(
             reverse=True,
         )
         utm_orders = sum(int(item["orders"]) for item in utm_details)
+        ga4_conversion = round_number(key_events / sessions * 100) if sessions else None
+        shopline_conversion = round_number(orders_count / sessions * 100) if sessions else None
+        order_details = sorted(
+            bucket["orderDetails"],
+            key=lambda item: (item["createdAt"], item["id"]),
+            reverse=True,
+        )
         channels.append(
             {
                 "channel": bucket["channel"],
                 "orders": orders_count,
+                "officialOrders": int(bucket["officialOrders"]),
+                "inferredOrders": max(0, orders_count - int(bucket["officialOrders"])),
                 "revenue": round_number(revenue),
                 "aov": round_number(revenue / orders_count if orders_count else 0),
                 "share": round_number(sessions / total_sessions * 100) if total_sessions else round_number(revenue / total_revenue * 100),
@@ -3129,7 +3474,14 @@ def build_channels(
                 "activeUsers": int(bucket["activeUsers"]),
                 "keyEvents": round_number(key_events),
                 "adSpend": round_number(float(bucket["adSpend"])),
-                "conversion": round_number(key_events / sessions * 100) if sessions else None,
+                "conversion": ga4_conversion,
+                "ga4Conversion": ga4_conversion,
+                "shoplineConversion": shopline_conversion,
+                "conversionDifference": (
+                    round_number(shopline_conversion - ga4_conversion)
+                    if shopline_conversion is not None and ga4_conversion is not None
+                    else None
+                ),
                 "sourceDetails": [
                     {"label": label, "sessions": count}
                     for label, count in details[:3]
@@ -3145,8 +3497,26 @@ def build_channels(
                 "utmOrders": utm_orders,
                 "utmCombinationCount": len(utm_details),
                 "utmCoverage": round_number(utm_orders / orders_count * 100) if orders_count else None,
+                "orderDetailCount": len(order_details),
+                "orderDetails": order_details[:20],
                 "trafficSource": "ga4" if sessions or ga4_rows else "shopline",
             }
+        )
+    shared_meta_sessions = any(
+        row["channel"] == "Facebook"
+        and any(
+            detail["label"].lower().startswith(("ad / facebook", "sl_smartads / facebook"))
+            for detail in row["sourceDetails"]
+        )
+        for row in channels
+    )
+    for row in channels:
+        shared_meta = shared_meta_sessions and row["channel"] in {"Facebook", "Instagram"}
+        row["conversionComparable"] = not shared_meta
+        row["conversionNote"] = (
+            "Meta 流量共用 facebook UTM，Facebook 与 Instagram 会话无法完全拆分"
+            if shared_meta
+            else "SHOPLINE 订单与 GA4 会话的跨系统估算"
         )
     sort_field = "sessions" if total_sessions else "revenue"
     return sorted(channels, key=lambda row: (row[sort_field], row["revenue"]), reverse=True)
@@ -3156,6 +3526,7 @@ def empty_channel_bucket(source: str) -> dict[str, Any]:
     return {
         "channel": source,
         "orders": 0,
+        "officialOrders": 0,
         "revenue": 0.0,
         "units": 0,
         "sessions": 0,
@@ -3164,6 +3535,7 @@ def empty_channel_bucket(source: str) -> dict[str, Any]:
         "adSpend": 0.0,
         "sourceDetails": {},
         "utmDetails": {},
+        "orderDetails": [],
     }
 
 
@@ -3174,6 +3546,10 @@ def build_channel_analytics(
 ) -> dict[str, Any]:
     ga4_rows = ga4_rows or []
     total_orders = len(orders)
+    official_orders = sum(
+        1 for order in orders if order.get("attributionMethod") == "shopline_attribution"
+    )
+    smartpush_orders = [order for order in orders if order.get("source") == "SmartPush"]
     attributed_orders = sum(
         1 for order in orders if str(order.get("source") or "") not in {"", "Direct", "Other"}
     )
@@ -3187,9 +3563,13 @@ def build_channel_analytics(
     return {
         "mode": "ga4_shopline" if ga4_rows else ("ga4_empty" if ga4_configured else "shopline"),
         "label": (
-            "GA4 渠道会话 + Shopline 订单"
+            "GA4 渠道会话 + SHOPLINE 官方订单归因"
             if ga4_rows
-            else ("GA4 已连接 · 所选日期暂无流量" if ga4_configured else "Shopline 订单归因")
+            else (
+                "SHOPLINE 官方订单归因 · GA4 暂无会话"
+                if ga4_configured
+                else "SHOPLINE 官方订单归因"
+            )
         ),
         "ga4Configured": ga4_configured,
         "sessionMetric": "session_start" if ga4_rows else None,
@@ -3200,6 +3580,12 @@ def build_channel_analytics(
         "orders": total_orders,
         "attributedOrders": attributed_orders,
         "orderAttributionRate": round_number(attributed_orders / total_orders * 100) if total_orders else None,
+        "officialOrders": official_orders,
+        "officialAttributionRate": round_number(official_orders / total_orders * 100) if total_orders else None,
+        "smartPushOrders": len(smartpush_orders),
+        "smartPushRevenue": round_number(
+            sum(float(order.get("total") or 0) for order in smartpush_orders)
+        ),
         "channelCount": len(channels),
     }
 
@@ -3650,6 +4036,9 @@ def build_sync_quality(
     attributed_orders = sum(
         1 for order in orders if str(order.get("source") or "") not in {"", "Direct", "Other"}
     )
+    official_attribution_orders = sum(
+        1 for order in orders if order.get("attributionMethod") == "shopline_attribution"
+    )
     identified_customers = sum(
         1 for order in orders if str(order.get("customerKey") or "").strip()
     )
@@ -3657,6 +4046,9 @@ def build_sync_quality(
         1 for order in orders if str(order.get("sourceCampaign") or "").strip()
     )
     attribution_rate = attributed_orders / total_orders * 100 if total_orders else 0
+    official_attribution_rate = (
+        official_attribution_orders / total_orders * 100 if total_orders else 0
+    )
     customer_rate = identified_customers / total_orders * 100 if total_orders else 0
     campaign_rate = campaign_orders / total_orders * 100 if total_orders else 0
     score = 100.0
@@ -3671,12 +4063,15 @@ def build_sync_quality(
         "grade": "A" if score >= 90 else "B" if score >= 75 else "C" if score >= 60 else "D",
         "orderPages": int(order_result.get("pages") or 0),
         "orderChunks": int(order_result.get("chunks") or 1),
+        "orderWindowCacheHits": int(order_result.get("windowCacheHits") or 0),
         "pageLimitReached": bool(order_result.get("pageLimitReached")),
         "rawOrders": int(order_result.get("rawCount") or total_orders),
         "normalizedOrders": int(order_result.get("normalizedCount") or total_orders),
         "duplicateOrders": int(order_result.get("duplicateCount") or 0),
         "productCount": int(product_result.get("rawCount") or 0),
         "attributionRate": round_number(attribution_rate),
+        "officialAttributionOrders": official_attribution_orders,
+        "officialAttributionRate": round_number(official_attribution_rate),
         "customerIdentificationRate": round_number(customer_rate),
         "campaignCoverage": round_number(campaign_rate),
         "channelCount": len(channels),
