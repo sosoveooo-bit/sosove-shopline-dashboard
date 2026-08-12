@@ -215,7 +215,7 @@
             <div class="reconcile-visual">
               <div><span>Shopline 订单</span><strong id="reconcile-shopline">--</strong></div>
               <b>⇄</b>
-              <div><span>GA4 Purchase</span><strong id="reconcile-ga4">--</strong></div>
+              <div><span>GA4 唯一交易</span><strong id="reconcile-ga4">--</strong></div>
             </div>
             <p class="panel-note" id="reconcile-note">--</p>
           </article>
@@ -280,7 +280,7 @@
               <div class="funnel-wrap">
                 <div class="funnel-header">
                   <span>转化漏斗</span>
-                  <small>会话 / 活跃用户 / Purchase / 订单</small>
+                  <small>会话 / 活跃用户 / 唯一交易 / 订单</small>
                 </div>
                 <div class="funnel-strip" id="conversion-funnel" aria-label="转化漏斗"></div>
               </div>
@@ -364,6 +364,17 @@
                 <strong id="channel-smartpush-orders">--</strong>
                 <small id="channel-smartpush-revenue">--</small>
               </div>
+            </div>
+            <div class="focus-channel-grid" id="focus-channel-grid" aria-label="重点来源订单">
+              <button type="button" class="focus-channel-card line" data-channel-drill="LINE">
+                <span><i></i>LINE</span><strong>--</strong><small>--</small><b>查看订单</b>
+              </button>
+              <button type="button" class="focus-channel-card yahoo" data-channel-drill="Yahoo">
+                <span><i></i>Yahoo</span><strong>--</strong><small>--</small><b>查看订单</b>
+              </button>
+              <button type="button" class="focus-channel-card organic" data-channel-drill="Organic">
+                <span><i></i>自然流量</span><strong>--</strong><small>--</small><b>查看订单</b>
+              </button>
             </div>
             <div class="table-wrap">
               <table class="channel-table" id="channel-table">
@@ -595,7 +606,14 @@
         </div>
         <footer class="channel-dialog-footer">
           <span id="channel-dialog-count">--</span>
-          <button type="button" class="button primary compact" id="channel-dialog-filter">在今日订单中筛选</button>
+          <div class="channel-dialog-actions">
+            <div class="channel-dialog-pagination" aria-label="渠道订单分页">
+              <button type="button" id="channel-dialog-prev" aria-label="上一页">‹</button>
+              <span id="channel-dialog-page">--</span>
+              <button type="button" id="channel-dialog-next" aria-label="下一页">›</button>
+            </div>
+            <button type="button" class="button primary compact" id="channel-dialog-filter">在今日订单中筛选</button>
+          </div>
         </footer>
       </div>
     </dialog>

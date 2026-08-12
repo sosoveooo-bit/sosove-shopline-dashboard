@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+import urllib.error
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +18,8 @@ from shopline_monitor.backend import (
     build_data_reconciliation,
     build_dashboard_payload,
     build_ga4_status,
+    build_profit_summary,
+    build_sync_quality,
     build_campaign_breakdown,
     build_channel_analytics,
     build_channels,
@@ -28,18 +31,22 @@ from shopline_monitor.backend import (
     build_order_query_params,
     build_url,
     ga4_conversion_rate,
+    ga4_purchase_count,
     load_traffic_from_env,
     merge_ga4_channel_session_starts,
+    merge_ga4_transaction_diagnostics,
     next_page_info_from_link,
     normalize_ga4_rate,
     normalize_ga4_channel_rows,
     normalize_ga4_channel,
+    normalize_ga4_transaction_rows,
     normalize_base_url,
     normalize_endpoint_path,
     normalize_shopline_orders,
     normalize_shopline_products,
     normalize_marketing_source,
     probe_ga4_connection,
+    reconcile_ga4_channel_sessions,
     apply_dashboard_filters,
     deduplicate_orders,
     clear_data_cache,
@@ -49,6 +56,24 @@ from shopline_monitor.server import dashboard_auth_enabled, parse_date_param, ve
 
 
 class BackendTests(unittest.TestCase):
+    ENV_PREFIXES = ("SHOPLINE_", "GA4_", "DASHBOARD_")
+    ENV_KEYS = {"GOOGLE_APPLICATION_CREDENTIALS"}
+
+    def setUp(self):
+        self._project_environment = {
+            key: value
+            for key, value in os.environ.items()
+            if key.startswith(self.ENV_PREFIXES) or key in self.ENV_KEYS
+        }
+        for key in self._project_environment:
+            os.environ.pop(key, None)
+
+    def tearDown(self):
+        for key in list(os.environ):
+            if key.startswith(self.ENV_PREFIXES) or key in self.ENV_KEYS:
+                os.environ.pop(key, None)
+        os.environ.update(self._project_environment)
+
     def test_normalize_orders_extracts_nested_payload(self):
         payload = {
             "data": {
@@ -214,6 +239,26 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(orders[0]["attributionMethod"], "shopline_attribution")
         self.assertEqual(orders[0]["attributionConfidence"], "high")
 
+    def test_shopline_official_attribution_prefers_yahoo_referrer_url_over_google_label(self):
+        orders = normalize_shopline_orders(
+            {"orders": [{"order_id": "yahoo-search", "total_price": "11789"}]},
+            default_currency="JPY",
+            attribution_by_order_id={
+                "yahoo-search": {
+                    "order_seq": "yahoo-search",
+                    "last_interaction": {
+                        "last_interaction_source": "Search",
+                        "last_referrer_name": "Google",
+                        "last_referrer_url": "https://search.yahoo.co.jp/",
+                        "last_utm_parameters": None,
+                    },
+                }
+            },
+        )
+
+        self.assertEqual(orders[0]["source"], "Yahoo")
+        self.assertEqual(orders[0]["sourceRaw"], "https://search.yahoo.co.jp/")
+
     def test_ga4_channels_merge_sessions_with_shopline_orders(self):
         response = SimpleNamespace(
             dimension_headers=[
@@ -331,6 +376,76 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(rows[0]["keyEvents"], 6)
         self.assertEqual(rows[0]["adCost"], 50)
 
+    def test_ga4_transactions_are_deduplicated_by_transaction_id(self):
+        response = SimpleNamespace(
+            dimension_headers=[
+                SimpleNamespace(name="date"),
+                SimpleNamespace(name="transactionId"),
+            ],
+            metric_headers=[SimpleNamespace(name="eventCount")],
+            rows=[
+                SimpleNamespace(
+                    dimension_values=[
+                        SimpleNamespace(value="20260617"),
+                        SimpleNamespace(value="order-1"),
+                    ],
+                    metric_values=[SimpleNamespace(value="2")],
+                ),
+                SimpleNamespace(
+                    dimension_values=[
+                        SimpleNamespace(value="20260617"),
+                        SimpleNamespace(value="order-2"),
+                    ],
+                    metric_values=[SimpleNamespace(value="1")],
+                ),
+                SimpleNamespace(
+                    dimension_values=[
+                        SimpleNamespace(value="20260617"),
+                        SimpleNamespace(value="(not set)"),
+                    ],
+                    metric_values=[SimpleNamespace(value="3")],
+                ),
+            ],
+        )
+
+        diagnostics = normalize_ga4_transaction_rows(response)
+        rows = merge_ga4_transaction_diagnostics(
+            [{"date": "2026-06-17", "sessions": 200, "keyEvents": 6}],
+            diagnostics,
+        )
+
+        self.assertEqual(rows[0]["transactions"], 2)
+        self.assertEqual(rows[0]["rawPurchaseEvents"], 6)
+        self.assertEqual(rows[0]["duplicatePurchaseEvents"], 4)
+        self.assertEqual(rows[0]["duplicateTransactionIds"], 1)
+        self.assertEqual(rows[0]["missingTransactionIdEvents"], 3)
+        self.assertEqual(ga4_purchase_count(rows), 2)
+        reconciliation = build_data_reconciliation([{"id": "1"}, {"id": "2"}], rows)
+        self.assertEqual(reconciliation["status"], "aligned")
+
+    def test_ga4_channel_session_gap_is_reconciled_to_total_sessions(self):
+        rows = reconcile_ga4_channel_sessions(
+            [
+                {
+                    "channel": "Facebook",
+                    "source": "facebook",
+                    "medium": "paid_social",
+                    "group": "Paid Social",
+                    "sessions": 80,
+                    "activeUsers": 60,
+                    "keyEvents": 4,
+                    "adCost": 0,
+                }
+            ],
+            100,
+        )
+
+        self.assertEqual(sum(row["sessions"] for row in rows), 100)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["sessions"], 100)
+        self.assertEqual(rows[0]["reportedSessions"], 80)
+        self.assertEqual(rows[0]["sessionMetric"], "sessions_normalized")
+
     def test_reconciliation_surfaces_ga4_query_error_instead_of_generic_missing(self):
         status = {"status": "error", "label": "GA4 接口异常"}
 
@@ -338,6 +453,15 @@ class BackendTests(unittest.TestCase):
 
         self.assertEqual(reconciliation["status"], "error")
         self.assertEqual(reconciliation["label"], "GA4 接口异常")
+
+    def test_reconciliation_marks_missing_shopline_orders_as_divergent(self):
+        reconciliation = build_data_reconciliation(
+            [],
+            [{"date": "2026-06-17", "transactions": 8, "keyEvents": 12}],
+        )
+
+        self.assertEqual(reconciliation["differenceRate"], 100)
+        self.assertEqual(reconciliation["status"], "divergent")
 
     def test_ga4_probe_returns_purchase_and_conversion(self):
         rows = [
@@ -711,6 +835,19 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(config.timeout_seconds, 30)
         self.assertEqual(config.retry_attempts, 3)
 
+    def test_shopline_default_timezone_matches_api_order_timestamps(self):
+        with patch.dict(os.environ, {}, clear=True):
+            config = ShoplineConfig.from_env()
+
+        self.assertEqual(config.timezone_name, "Asia/Shanghai")
+        params = build_order_query_params(
+            date(2026, 8, 11),
+            date(2026, 8, 11),
+            timezone_name=config.timezone_name,
+        )
+        self.assertTrue(params["created_at_min"].endswith("+08:00"))
+        self.assertTrue(params["created_at_max"].endswith("+08:00"))
+
     def test_order_query_params_include_any_status_and_recent_sort(self):
         params = build_order_query_params(date(2026, 6, 11), date(2026, 6, 17), limit=500)
 
@@ -752,6 +889,43 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(headers, {})
         self.assertEqual(urlopen.call_count, 2)
         sleep.assert_called_once()
+
+    def test_shopline_429_retry_honors_retry_after_header(self):
+        class FakeResponse:
+            headers = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return b'{"orders":[]}'
+
+        client = ShoplineClient(
+            ShoplineConfig(
+                base_url="https://store.example/admin/openapi/v20260301",
+                access_token="token-value",
+                orders_path="/orders.json",
+                retry_attempts=2,
+            )
+        )
+        rate_limit = urllib.error.HTTPError(
+            "https://store.example/orders.json",
+            429,
+            "Too Many Requests",
+            {"Retry-After": "3"},
+            None,
+        )
+        with patch(
+            "shopline_monitor.backend.urllib.request.urlopen",
+            side_effect=[rate_limit, FakeResponse()],
+        ), patch("shopline_monitor.backend.time_module.sleep") as sleep:
+            payload, _ = client.request_json_with_headers("/orders.json")
+
+        self.assertEqual(payload, {"orders": []})
+        sleep.assert_called_once_with(3.0)
 
     def test_load_orders_uses_shopline_recent_order_query(self):
         class RecordingClient(ShoplineClient):
@@ -892,6 +1066,29 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(analytics["smartPushOrders"], 1)
         self.assertEqual(analytics["smartPushRevenue"], 8430)
 
+    def test_channel_order_details_are_not_truncated(self):
+        orders = [
+            {
+                "id": f"instagram-{index}",
+                "createdAt": "2026-08-12",
+                "source": "Instagram",
+                "total": 100,
+                "units": 1,
+                "status": "paid",
+                "attributionMethod": "shopline_attribution",
+                "attributionConfidence": "high",
+            }
+            for index in range(24)
+        ]
+
+        instagram = next(
+            row for row in build_channels(orders) if row["channel"] == "Instagram"
+        )
+
+        self.assertEqual(instagram["orders"], 24)
+        self.assertEqual(instagram["orderDetailCount"], 24)
+        self.assertEqual(len(instagram["orderDetails"]), 24)
+
     def test_load_orders_follows_shopline_next_page_link(self):
         class PagingClient(ShoplineClient):
             def __init__(self):
@@ -1000,6 +1197,39 @@ class BackendTests(unittest.TestCase):
         )
 
         self.assertEqual(next_page_info_from_link(link), "abc+123")
+
+    def test_load_products_follows_shopline_next_page_link(self):
+        class PagingProductClient(ShoplineClient):
+            def __init__(self):
+                super().__init__(
+                    ShoplineConfig(
+                        base_url="https://store.example/admin/openapi/v20260301",
+                        access_token="token-value",
+                        products_path="/products/products.json",
+                        max_product_pages=3,
+                    )
+                )
+                self.calls = []
+
+            def request_json_with_headers(self, path, params=None):
+                self.calls.append((path, dict(params or {})))
+                if params and params.get("page_info") == "page-2":
+                    return {
+                        "products": [{"product_id": "p-2", "title": "Coat"}]
+                    }, {}
+                return {
+                    "products": [{"product_id": "p-1", "title": "Dress"}]
+                }, {
+                    "Link": '<https://store.example/products/products.json?limit=50&page_info=page-2>; rel="next"'
+                }
+
+        result = PagingProductClient().load_products(today=date(2026, 6, 17))
+
+        self.assertEqual(result["source"], "live")
+        self.assertEqual(result["rawCount"], 2)
+        self.assertEqual(result["pages"], 2)
+        self.assertFalse(result["pageLimitReached"])
+        self.assertEqual(len(result["items"]), 2)
 
     def test_dashboard_fetches_current_and_previous_order_windows_separately(self):
         class FakeClient:
@@ -1485,6 +1715,79 @@ class BackendTests(unittest.TestCase):
 
         self.assertEqual([row["id"] for row in unique], ["1", "2"])
         self.assertEqual(duplicates, 1)
+
+    def test_sync_quality_penalizes_ga4_divergence_and_duplicate_events(self):
+        quality = build_sync_quality(
+            {"pages": 1, "chunks": 1, "rawCount": 10},
+            [
+                {"source": "Facebook", "customerKey": f"c-{index}"}
+                for index in range(10)
+            ],
+            {"rawCount": 80, "pages": 2, "pageLimitReached": False},
+            [{"channel": "Facebook"}],
+            [],
+            reconciliation={"differenceRate": 35},
+            ga4_status={
+                "rawPurchaseEvents": 14,
+                "duplicatePurchaseEvents": 4,
+                "duplicateTransactionIds": 2,
+            },
+        )
+
+        self.assertLess(quality["score"], 90)
+        self.assertNotEqual(quality["grade"], "A")
+        self.assertEqual(quality["productPages"], 2)
+        self.assertEqual(quality["ga4DuplicatePurchaseEvents"], 4)
+
+    def test_profit_summary_marks_missing_exact_costs_as_low_confidence(self):
+        profit = build_profit_summary(
+            [
+                {
+                    "total": 100,
+                    "refundTotal": 0,
+                    "discounts": 0,
+                    "taxTotal": 0,
+                    "market": "JP",
+                    "items": [
+                        {"sku": "SKU-1", "quantity": 1, "revenue": 100}
+                    ],
+                }
+            ],
+            [],
+            CostConfig(
+                product_cost_rate=0.35,
+                payment_fee_rate=0.036,
+                shipping_cost_per_order=0,
+            ),
+            {},
+        )
+
+        self.assertEqual(profit["confidence"], "low")
+        self.assertEqual(profit["costCoverage"], 0)
+        self.assertFalse(profit["shippingConfigured"])
+        self.assertGreaterEqual(len(profit["warnings"]), 2)
+
+    def test_frontend_sync_contract_keeps_filters_usable_and_sets_timeout(self):
+        app_js = (
+            Path(__file__).resolve().parents[1] / "static" / "app.js"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('const REQUEST_TIMEOUT_MS = 60000;', app_js)
+        self.assertIn('["sync-btn", "test-connector-btn"].forEach', app_js)
+        self.assertNotIn('document.querySelectorAll("button, input, select")', app_js)
+        self.assertIn('if (!state.autoRefreshMs || document.hidden', app_js)
+
+    def test_frontend_exposes_focus_channels_and_paginated_channel_orders(self):
+        package_root = Path(__file__).resolve().parents[1]
+        app_js = (package_root / "static" / "app.js").read_text(encoding="utf-8")
+        index_html = (package_root / "static" / "index.html").read_text(encoding="utf-8")
+
+        self.assertIn('const CHANNEL_DIALOG_PAGE_SIZE = 10;', app_js)
+        self.assertIn('function renderFocusChannels(', app_js)
+        self.assertIn('function changeChannelDialogPage(', app_js)
+        self.assertIn('data-channel-drill="LINE"', index_html)
+        self.assertIn('data-channel-drill="Yahoo"', index_html)
+        self.assertIn('data-channel-drill="Organic"', index_html)
 
     def test_optional_dashboard_authentication(self):
         with patch.dict(os.environ, {"DASHBOARD_ACCESS_TOKEN": "secret-token"}):

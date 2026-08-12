@@ -24,9 +24,11 @@ from zoneinfo import ZoneInfo
 SUPPORTED_RANGES = {"1d": 1, "7d": 7, "30d": 30, "90d": 90}
 DEFAULT_CURRENCY = "USD"
 DEFAULT_API_VERSION = "v20260301"
-DEFAULT_TIMEZONE = "Asia/Tokyo"
+DEFAULT_TIMEZONE = "Asia/Shanghai"
 ORDER_PAGE_LIMIT = 100
 DEFAULT_MAX_ORDER_PAGES = 5
+PRODUCT_PAGE_LIMIT = 50
+DEFAULT_MAX_PRODUCT_PAGES = 25
 DEFAULT_PRODUCT_COST_RATE = 0.35
 DEFAULT_PAYMENT_FEE_RATE = 0.036
 DEFAULT_SHIPPING_COST_PER_ORDER = 0.0
@@ -191,6 +193,7 @@ class ShoplineConfig:
     timezone_name: str = DEFAULT_TIMEZONE
     conversion_traffic_field: str = DEFAULT_CONVERSION_TRAFFIC_FIELD
     max_order_pages: int = DEFAULT_MAX_ORDER_PAGES
+    max_product_pages: int = DEFAULT_MAX_PRODUCT_PAGES
 
     @classmethod
     def from_env(cls) -> "ShoplineConfig":
@@ -201,6 +204,9 @@ class ShoplineConfig:
             "SHOPLINE_RETRY_ATTEMPTS", str(DEFAULT_SHOPLINE_RETRY_ATTEMPTS)
         )
         max_order_pages_raw = os.getenv("SHOPLINE_MAX_ORDER_PAGES", str(DEFAULT_MAX_ORDER_PAGES))
+        max_product_pages_raw = os.getenv(
+            "SHOPLINE_MAX_PRODUCT_PAGES", str(DEFAULT_MAX_PRODUCT_PAGES)
+        )
         api_version = os.getenv("SHOPLINE_API_VERSION", DEFAULT_API_VERSION).strip() or DEFAULT_API_VERSION
         try:
             timeout = max(1.0, float(timeout_raw))
@@ -214,6 +220,10 @@ class ShoplineConfig:
             max_order_pages = max(1, min(25, int(max_order_pages_raw)))
         except ValueError:
             max_order_pages = DEFAULT_MAX_ORDER_PAGES
+        try:
+            max_product_pages = max(1, min(100, int(max_product_pages_raw)))
+        except ValueError:
+            max_product_pages = DEFAULT_MAX_PRODUCT_PAGES
 
         raw_base_url = os.getenv("SHOPLINE_API_BASE_URL", "").strip()
         raw_orders_path = os.getenv("SHOPLINE_ORDERS_ENDPOINT", "").strip()
@@ -246,6 +256,7 @@ class ShoplineConfig:
                 os.getenv("SHOPLINE_CONVERSION_TRAFFIC_FIELD", DEFAULT_CONVERSION_TRAFFIC_FIELD)
             ),
             max_order_pages=max_order_pages,
+            max_product_pages=max_product_pages,
         )
 
     @property
@@ -372,6 +383,7 @@ class ShoplineClient:
             "trafficConfigured": bool(load_traffic_from_env()),
             "conversionTrafficField": self.config.conversion_traffic_field,
             "maxOrderPages": self.config.max_order_pages,
+            "maxProductPages": self.config.max_product_pages,
             "requestTimeoutSeconds": self.config.timeout_seconds,
             "retryAttempts": self.config.retry_attempts,
             "clickCampaignMapCount": len(load_click_campaign_map_from_env()),
@@ -588,6 +600,8 @@ class ShoplineClient:
                 "source": "sample",
                 "error": None,
                 "rawCount": len(items),
+                "pages": 1,
+                "pageLimitReached": False,
             }
 
         cache_key = f"shopline:products:{self.config.base_url}:{today.isoformat()}"
@@ -597,13 +611,44 @@ class ShoplineClient:
             cached["cached"] = True
             return cached
         try:
-            payload = self.request_json(self.config.products_path, params={"limit": "50"})
-            products = normalize_shopline_products(payload, self.config.default_currency)
+            raw_products: list[dict[str, Any]] = []
+            pages = 0
+            has_next_page = False
+            seen_page_info: set[str] = set()
+            params = {"limit": str(PRODUCT_PAGE_LIMIT)}
+            while pages < self.config.max_product_pages:
+                payload, headers = self.request_json_with_headers(
+                    self.config.products_path,
+                    params=params,
+                )
+                page_products = [
+                    product
+                    for product in extract_collection(
+                        payload,
+                        ["products", "product_list", "items", "data", "results"],
+                    )
+                    if isinstance(product, dict)
+                ]
+                raw_products.extend(page_products)
+                pages += 1
+                page_info = next_page_info_from_link(headers.get("Link") or headers.get("link", ""))
+                has_next_page = bool(page_info)
+                if not page_info or page_info in seen_page_info:
+                    break
+                seen_page_info.add(page_info)
+                params = {"limit": str(PRODUCT_PAGE_LIMIT), "page_info": page_info}
+
+            products = normalize_shopline_products(
+                {"products": raw_products},
+                self.config.default_currency,
+            )
             result = {
                 "items": products,
                 "source": "live",
                 "error": None,
-                "rawCount": len(products),
+                "rawCount": len(raw_products),
+                "pages": pages,
+                "pageLimitReached": has_next_page and pages >= self.config.max_product_pages,
                 "cached": False,
             }
             if use_cache:
@@ -627,6 +672,8 @@ class ShoplineClient:
                 "source": "error",
                 "error": f"Shopline 商品拉取失败：{error}",
                 "rawCount": 0,
+                "pages": 0,
+                "pageLimitReached": False,
                 "cached": False,
                 "stale": False,
             }
@@ -664,6 +711,7 @@ class ShoplineClient:
     def _open_json_with_retry(self, request_factory: Any) -> tuple[Any, dict[str, str]]:
         attempts = max(1, int(self.config.retry_attempts))
         for attempt in range(attempts):
+            retry_delay = min(0.5 * (2**attempt), 2.0)
             try:
                 request = request_factory()
                 with urllib.request.urlopen(
@@ -675,10 +723,17 @@ class ShoplineClient:
                 retryable = exc.code == 429 or 500 <= exc.code < 600
                 if not retryable or attempt + 1 >= attempts:
                     raise
+                if exc.code == 429:
+                    retry_delay = max(retry_delay, min(10.0, 2.0 * (2**attempt)))
+                    retry_after = parse_optional_float(
+                        (exc.headers or {}).get("Retry-After")
+                    )
+                    if retry_after is not None:
+                        retry_delay = max(retry_delay, min(20.0, retry_after))
             except (TimeoutError, ConnectionError, urllib.error.URLError):
                 if attempt + 1 >= attempts:
                     raise
-            time_module.sleep(min(0.5 * (2**attempt), 2.0))
+            time_module.sleep(retry_delay)
 
         raise RuntimeError("Shopline request retry loop exited unexpectedly")
 
@@ -888,6 +943,12 @@ def build_dashboard_payload(
     series = build_series(current_start, today, current_orders, current_traffic)
     lookback_series = build_series(lookback_start, today, lookback_orders, lookback_traffic)
     ga4_channel_rows = apply_ga4_channel_filter(ga4_channels.rows, normalized_filters)
+    ga4_total_sessions = sum_optional_int(row.get("sessions") for row in current_ga4_rows)
+    if not normalized_filters.get("channel"):
+        ga4_channel_rows = reconcile_ga4_channel_sessions(
+            ga4_channel_rows,
+            ga4_total_sessions,
+        )
     channels = build_channels(current_orders, ga4_channel_rows)
     campaigns = build_campaign_breakdown(current_orders)
     attribution_diagnostics = build_attribution_diagnostics(current_orders)
@@ -948,6 +1009,8 @@ def build_dashboard_payload(
         products_result,
         channels,
         errors,
+        reconciliation=reconciliation,
+        ga4_status=ga4_status,
     )
     alerts = build_alerts_v2(
         current_kpis,
@@ -1009,7 +1072,12 @@ def build_dashboard_payload(
             current_ga4_rows,
         ),
         "channels": channels,
-        "channelAnalytics": build_channel_analytics(current_orders, channels, ga4_channel_rows),
+        "channelAnalytics": build_channel_analytics(
+            current_orders,
+            channels,
+            ga4_channel_rows,
+            ga4_total_sessions=ga4_total_sessions,
+        ),
         "campaigns": campaigns,
         "attributionDiagnostics": attribution_diagnostics,
         "reconciliation": reconciliation,
@@ -1693,9 +1761,14 @@ def extract_shopline_last_touch_attribution(
     ).strip()
     tracking = extract_shopline_attribution_tracking(attribution_info)
 
+    url_source = infer_traffic_source_from_url(source_url)
     source = normalize_shopline_attribution_source(source_name) if source_name else ""
+    # Referrer domains are stronger evidence when SHOPLINE's source label and
+    # URL disagree (for example Google + search.yahoo.co.jp).
+    if url_source in TRAFFIC_SOURCE_BUCKETS and url_source not in {"Direct", "Other"}:
+        source = url_source
     if source not in TRAFFIC_SOURCE_BUCKETS:
-        source = infer_traffic_source_from_url(source_url or landing_page)
+        source = infer_traffic_source_from_url(landing_page)
     if source not in TRAFFIC_SOURCE_BUCKETS:
         source = normalize_marketing_source(
             f"{tracking.get('utm_source', '')} {tracking.get('utm_medium', '')}".strip()
@@ -1711,7 +1784,7 @@ def extract_shopline_last_touch_attribution(
 
     return attribution_result(
         source,
-        source_name or source_url or landing_page or source,
+        source_url or source_name or landing_page or source,
         tracking.get("utm_medium", ""),
         tracking.get("utm_campaign", ""),
         "shopline_attribution",
@@ -2425,7 +2498,13 @@ def probe_ga4_connection(today: date | None = None) -> dict[str, Any]:
     try:
         rows = fetch_ga4_traffic_series(config, target_date, target_date)
         sessions = sum(parse_int(row.get("sessions")) for row in rows)
-        purchases = sum(parse_optional_float(row.get("keyEvents")) or 0 for row in rows)
+        purchases = ga4_purchase_count(rows) or 0
+        raw_purchase_events = sum(
+            parse_optional_float(row.get("rawPurchaseEvents")) or 0 for row in rows
+        )
+        duplicate_purchase_events = sum(
+            parse_int(row.get("duplicatePurchaseEvents")) for row in rows
+        )
         conversion = ga4_conversion_rate(rows, config.conversion_mode)
         return {
             "ok": True,
@@ -2439,6 +2518,8 @@ def probe_ga4_connection(today: date | None = None) -> dict[str, Any]:
             "rows": len(rows),
             "sessions": sessions if rows else None,
             "purchases": round_number(purchases) if rows else None,
+            "rawPurchaseEvents": round_number(raw_purchase_events) if rows else None,
+            "duplicatePurchaseEvents": duplicate_purchase_events if rows else None,
             "conversion": conversion,
             "date": target_date.isoformat(),
             "checkedAt": checked_at,
@@ -2484,7 +2565,14 @@ def fetch_ga4_traffic_series(
 ) -> list[dict[str, Any]]:
     try:
         from google.analytics.data_v1beta import BetaAnalyticsDataClient
-        from google.analytics.data_v1beta.types import DateRange, Dimension, Metric, RunReportRequest
+        from google.analytics.data_v1beta.types import (
+            DateRange,
+            Dimension,
+            Filter,
+            FilterExpression,
+            Metric,
+            RunReportRequest,
+        )
         from google.oauth2 import service_account
     except ImportError as exc:  # pragma: no cover - depends on optional package availability
         raise RuntimeError("google-analytics-data is not installed") from exc
@@ -2515,7 +2603,30 @@ def fetch_ga4_traffic_series(
         ],
     )
     response = client.run_report(request=request, timeout=config.timeout_seconds)
-    return normalize_ga4_rows(response, config.metric_name)
+    transaction_request = RunReportRequest(
+        property=ga4_property_name(config.property_id),
+        date_ranges=[DateRange(start_date=start.isoformat(), end_date=end.isoformat())],
+        dimensions=[Dimension(name="date"), Dimension(name="transactionId")],
+        metrics=[Metric(name="eventCount")],
+        dimension_filter=FilterExpression(
+            filter=Filter(
+                field_name="eventName",
+                string_filter=Filter.StringFilter(
+                    value=config.key_event_name,
+                    match_type=Filter.StringFilter.MatchType.EXACT,
+                ),
+            )
+        ),
+        limit=100000,
+    )
+    transaction_response = client.run_report(
+        request=transaction_request,
+        timeout=config.timeout_seconds,
+    )
+    return merge_ga4_transaction_diagnostics(
+        normalize_ga4_rows(response, config.metric_name),
+        normalize_ga4_transaction_rows(transaction_response),
+    )
 
 
 def fetch_ga4_channel_rows(
@@ -2528,8 +2639,6 @@ def fetch_ga4_channel_rows(
         from google.analytics.data_v1beta.types import (
             DateRange,
             Dimension,
-            Filter,
-            FilterExpression,
             Metric,
             RunReportRequest,
         )
@@ -2567,38 +2676,7 @@ def fetch_ga4_channel_rows(
         limit=250,
     )
     response = client.run_report(request=request, timeout=config.timeout_seconds)
-
-    # GA4's `sessions` metric is non-additive for this property's source
-    # dimensions. Count session_start events for the channel table instead so
-    # each session is represented once and channel totals remain reconcilable.
-    session_request = RunReportRequest(
-        property=ga4_property_name(config.property_id),
-        date_ranges=[DateRange(start_date=start.isoformat(), end_date=end.isoformat())],
-        dimensions=[
-            Dimension(name="sessionSource"),
-            Dimension(name="sessionMedium"),
-            Dimension(name="sessionDefaultChannelGroup"),
-        ],
-        metrics=[Metric(name="eventCount"), Metric(name="activeUsers")],
-        dimension_filter=FilterExpression(
-            filter=Filter(
-                field_name="eventName",
-                string_filter=Filter.StringFilter(
-                    value="session_start",
-                    match_type=Filter.StringFilter.MatchType.EXACT,
-                ),
-            )
-        ),
-        limit=250,
-    )
-    session_response = client.run_report(
-        request=session_request,
-        timeout=config.timeout_seconds,
-    )
-    return merge_ga4_channel_session_starts(
-        normalize_ga4_channel_rows(response),
-        normalize_ga4_session_start_rows(session_response),
-    )
+    return normalize_ga4_channel_rows(response)
 
 
 def normalize_ga4_channel_rows(response: Any) -> list[dict[str, Any]]:
@@ -2635,6 +2713,9 @@ def normalize_ga4_channel_rows(response: Any) -> list[dict[str, Any]]:
                 "activeUsers": max(0, parse_int(metric_map.get("activeUsers"))),
                 "keyEvents": max(0, parse_optional_float(key_events) or 0),
                 "adCost": max(0, parse_optional_float(metric_map.get("advertiserAdCost")) or 0),
+                "reportedSessions": max(0, parse_int(metric_map.get("sessions"))),
+                "reportedActiveUsers": max(0, parse_int(metric_map.get("activeUsers"))),
+                "sessionMetric": "sessions",
             }
         )
     return rows
@@ -2721,6 +2802,56 @@ def merge_ga4_channel_session_starts(
     return merged
 
 
+def reconcile_ga4_channel_sessions(
+    channel_rows: list[dict[str, Any]],
+    expected_sessions: int | None,
+) -> list[dict[str, Any]]:
+    rows = [dict(row) for row in channel_rows]
+    if expected_sessions is None:
+        return rows
+    current_sessions = sum(parse_int(row.get("sessions")) for row in rows)
+    expected_sessions = max(0, int(expected_sessions))
+    if current_sessions == expected_sessions:
+        return rows
+    if current_sessions <= 0:
+        if expected_sessions:
+            rows.append(
+                {
+                    "channel": "Other",
+                    "source": "(other)",
+                    "medium": "(not set)",
+                    "group": "Unassigned",
+                    "sessions": expected_sessions,
+                    "activeUsers": 0,
+                    "keyEvents": 0.0,
+                    "adCost": 0.0,
+                    "reportedSessions": 0,
+                    "reportedActiveUsers": 0,
+                    "sessionMetric": "sessions_normalized",
+                }
+            )
+        return rows
+
+    scale = expected_sessions / current_sessions
+    allocations = []
+    for index, row in enumerate(rows):
+        reported_sessions = parse_int(row.get("sessions"))
+        scaled_sessions = reported_sessions * scale
+        allocated_sessions = int(math.floor(scaled_sessions))
+        allocations.append(
+            (index, allocated_sessions, scaled_sessions - allocated_sessions)
+        )
+        row["reportedSessions"] = reported_sessions
+        row["sessions"] = allocated_sessions
+        row["sessionScale"] = round_number(scale)
+        row["sessionMetric"] = "sessions_normalized"
+
+    remainder = expected_sessions - sum(item[1] for item in allocations)
+    for index, _, _ in sorted(allocations, key=lambda item: item[2], reverse=True)[:remainder]:
+        rows[index]["sessions"] += 1
+    return rows
+
+
 def normalize_ga4_channel(source: Any, medium: Any, group: Any) -> str:
     source_text = str(source or "").strip()
     medium_text = str(medium or "").strip()
@@ -2803,6 +2934,84 @@ def normalize_ga4_rows(response: Any, metric_name: str) -> list[dict[str, Any]]:
             }
         )
     return sorted(rows, key=lambda row: row["date"])
+
+
+def normalize_ga4_transaction_rows(response: Any) -> list[dict[str, Any]]:
+    dimensions = [header.name for header in getattr(response, "dimension_headers", [])]
+    metrics = [header.name for header in getattr(response, "metric_headers", [])]
+    daily: dict[str, dict[str, Any]] = {}
+    for row in getattr(response, "rows", []):
+        dimension_map = {
+            dimensions[index]: value.value
+            for index, value in enumerate(getattr(row, "dimension_values", []))
+            if index < len(dimensions)
+        }
+        metric_map = {
+            metrics[index]: value.value
+            for index, value in enumerate(getattr(row, "metric_values", []))
+            if index < len(metrics)
+        }
+        day = normalize_ga4_date(dimension_map.get("date"))
+        if not day:
+            continue
+        transaction_id = str(dimension_map.get("transactionId") or "").strip()
+        event_count = max(0, parse_int(metric_map.get("eventCount")))
+        bucket = daily.setdefault(
+            day,
+            {
+                "date": day,
+                "transactions": 0,
+                "rawPurchaseEvents": 0,
+                "duplicatePurchaseEvents": 0,
+                "duplicateTransactionIds": 0,
+                "missingTransactionIdEvents": 0,
+            },
+        )
+        bucket["rawPurchaseEvents"] += event_count
+        if transaction_id.lower() in {"", "(not set)", "not set", "undefined"}:
+            bucket["missingTransactionIdEvents"] += event_count
+            bucket["duplicatePurchaseEvents"] += event_count
+            continue
+        bucket["transactions"] += 1
+        if event_count > 1:
+            bucket["duplicateTransactionIds"] += 1
+            bucket["duplicatePurchaseEvents"] += event_count - 1
+    return [daily[key] for key in sorted(daily)]
+
+
+def merge_ga4_transaction_diagnostics(
+    traffic_rows: list[dict[str, Any]],
+    transaction_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    transaction_by_date = {str(row.get("date")): row for row in transaction_rows}
+    merged = []
+    for row in traffic_rows:
+        diagnostics = transaction_by_date.get(str(row.get("date")), {})
+        merged.append(
+            {
+                **row,
+                "transactions": parse_int(diagnostics.get("transactions")),
+                "rawPurchaseEvents": parse_int(diagnostics.get("rawPurchaseEvents")),
+                "duplicatePurchaseEvents": parse_int(
+                    diagnostics.get("duplicatePurchaseEvents")
+                ),
+                "duplicateTransactionIds": parse_int(
+                    diagnostics.get("duplicateTransactionIds")
+                ),
+                "missingTransactionIdEvents": parse_int(
+                    diagnostics.get("missingTransactionIdEvents")
+                ),
+                "purchaseMetric": "unique_transaction_id",
+            }
+        )
+    return merged
+
+
+def ga4_purchase_count(rows: Iterable[dict[str, Any]]) -> float | None:
+    rows = list(rows)
+    if any("transactions" in row for row in rows):
+        return sum_optional_float(row.get("transactions") for row in rows)
+    return sum_optional_float(row.get("keyEvents") for row in rows)
 
 
 def normalize_ga4_date(value: Any) -> str:
@@ -2916,6 +3125,12 @@ def merge_traffic_series(
                 "activeUsers",
                 "totalUsers",
                 "keyEvents",
+                "transactions",
+                "rawPurchaseEvents",
+                "duplicatePurchaseEvents",
+                "duplicateTransactionIds",
+                "missingTransactionIdEvents",
+                "purchaseMetric",
                 "shoplineOrders",
                 "conversion",
                 "conversionMode",
@@ -3191,6 +3406,8 @@ def build_series(
         active_users_value = traffic_row.get("activeUsers")
         total_users_value = traffic_row.get("totalUsers")
         key_events_value = traffic_row.get("keyEvents")
+        transactions_value = traffic_row.get("transactions")
+        raw_purchase_events_value = traffic_row.get("rawPurchaseEvents")
         shopline_orders_value = traffic_row.get("shoplineOrders")
         active_users = (
             parse_int(active_users_value) if active_users_value is not None else None
@@ -3198,6 +3415,16 @@ def build_series(
         total_users = parse_int(total_users_value) if total_users_value is not None else None
         key_events = (
             parse_optional_float(key_events_value) if key_events_value is not None else None
+        )
+        transactions = (
+            parse_optional_float(transactions_value)
+            if transactions_value is not None
+            else None
+        )
+        raw_purchase_events = (
+            parse_optional_float(raw_purchase_events_value)
+            if raw_purchase_events_value is not None
+            else None
         )
         shopline_orders = (
             parse_int(shopline_orders_value) if shopline_orders_value is not None else None
@@ -3217,6 +3444,17 @@ def build_series(
                 "activeUsers": active_users,
                 "totalUsers": total_users,
                 "keyEvents": key_events,
+                "transactions": transactions,
+                "rawPurchaseEvents": raw_purchase_events,
+                "duplicatePurchaseEvents": parse_int(
+                    traffic_row.get("duplicatePurchaseEvents")
+                ),
+                "duplicateTransactionIds": parse_int(
+                    traffic_row.get("duplicateTransactionIds")
+                ),
+                "missingTransactionIdEvents": parse_int(
+                    traffic_row.get("missingTransactionIdEvents")
+                ),
                 "shoplineOrders": shopline_orders,
                 "conversion": conversion,
             }
@@ -3278,7 +3516,7 @@ def summarize_series_window(label: str, rows: list[dict[str, Any]]) -> dict[str,
     revenue = sum(float(row.get("revenue") or 0) for row in rows)
     orders = sum(int(row.get("orders") or 0) for row in rows)
     sessions = sum_optional_int(row.get("sessions") for row in rows)
-    key_events = sum_optional_float(row.get("keyEvents") for row in rows)
+    key_events = ga4_purchase_count(rows)
     conversion_values = [
         float(row.get("conversion"))
         for row in rows
@@ -3307,13 +3545,13 @@ def build_conversion_funnel(
 ) -> list[dict[str, Any]]:
     sessions = sum_optional_int(row.get("sessions") for row in ga4_rows)
     active_users = sum_optional_int(row.get("activeUsers") for row in ga4_rows)
-    key_events = sum_optional_float(row.get("keyEvents") for row in ga4_rows)
+    key_events = ga4_purchase_count(ga4_rows)
     shopline_orders = len(orders)
 
     raw_steps = [
         ("访问会话", sessions),
         ("活跃用户", active_users),
-        ("GA4 Purchase", key_events),
+        ("GA4 唯一交易", key_events),
         ("Shopline 订单", shopline_orders),
     ]
     available_steps = [(label, value) for label, value in raw_steps if value is not None]
@@ -3498,7 +3736,7 @@ def build_channels(
                 "utmCombinationCount": len(utm_details),
                 "utmCoverage": round_number(utm_orders / orders_count * 100) if orders_count else None,
                 "orderDetailCount": len(order_details),
-                "orderDetails": order_details[:20],
+                "orderDetails": order_details,
                 "trafficSource": "ga4" if sessions or ga4_rows else "shopline",
             }
         )
@@ -3543,6 +3781,7 @@ def build_channel_analytics(
     orders: list[dict[str, Any]],
     channels: list[dict[str, Any]],
     ga4_rows: list[dict[str, Any]] | None = None,
+    ga4_total_sessions: int | None = None,
 ) -> dict[str, Any]:
     ga4_rows = ga4_rows or []
     total_orders = len(orders)
@@ -3554,6 +3793,12 @@ def build_channel_analytics(
         1 for order in orders if str(order.get("source") or "") not in {"", "Direct", "Other"}
     )
     total_sessions = sum(parse_int(row.get("sessions")) for row in channels)
+    session_difference = (
+        total_sessions - ga4_total_sessions if ga4_total_sessions is not None else None
+    )
+    sessions_normalized = any(
+        row.get("sessionMetric") == "sessions_normalized" for row in ga4_rows
+    )
     attributed_sessions = sum(
         parse_int(row.get("sessions"))
         for row in channels
@@ -3563,7 +3808,11 @@ def build_channel_analytics(
     return {
         "mode": "ga4_shopline" if ga4_rows else ("ga4_empty" if ga4_configured else "shopline"),
         "label": (
-            "GA4 渠道会话 + SHOPLINE 官方订单归因"
+            (
+                "GA4 总会话校准渠道占比 + SHOPLINE 官方订单归因"
+                if sessions_normalized
+                else "GA4 渠道会话 + SHOPLINE 官方订单归因"
+            )
             if ga4_rows
             else (
                 "SHOPLINE 官方订单归因 · GA4 暂无会话"
@@ -3572,8 +3821,14 @@ def build_channel_analytics(
             )
         ),
         "ga4Configured": ga4_configured,
-        "sessionMetric": "session_start" if ga4_rows else None,
+        "sessionMetric": (
+            "sessions_normalized" if sessions_normalized else "sessions" if ga4_rows else None
+        ),
+        "sessionsNormalized": sessions_normalized,
         "sessions": total_sessions,
+        "ga4TotalSessions": ga4_total_sessions,
+        "sessionDifference": session_difference,
+        "sessionsReconciled": session_difference == 0 if session_difference is not None else None,
         "activeUsers": sum(parse_int(row.get("activeUsers")) for row in channels),
         "attributedSessions": attributed_sessions,
         "attributionRate": round_number(attributed_sessions / total_sessions * 100) if total_sessions else None,
@@ -3949,8 +4204,25 @@ def build_ga4_status(
     active_errors = [str(error) for error in errors if error]
     sessions = sum_optional_int(row.get("sessions") for row in traffic_rows)
     active_users = sum_optional_int(row.get("activeUsers") for row in traffic_rows)
-    purchases = sum_optional_float(row.get("keyEvents") for row in traffic_rows)
+    purchases = ga4_purchase_count(traffic_rows)
+    raw_purchase_events = sum_optional_float(
+        row.get("rawPurchaseEvents") for row in traffic_rows
+    )
+    duplicate_purchase_events = sum(
+        parse_int(row.get("duplicatePurchaseEvents")) for row in traffic_rows
+    )
+    duplicate_transaction_ids = sum(
+        parse_int(row.get("duplicateTransactionIds")) for row in traffic_rows
+    )
+    missing_transaction_id_events = sum(
+        parse_int(row.get("missingTransactionIdEvents")) for row in traffic_rows
+    )
     conversion = ga4_conversion_rate(traffic_rows, config.conversion_mode)
+    session_purchase_rate = (
+        round_number(float(purchases) / sessions * 100)
+        if purchases is not None and sessions
+        else None
+    )
 
     if not config.configured:
         status = "unconfigured"
@@ -3978,7 +4250,17 @@ def build_ga4_status(
         "sessions": sessions,
         "activeUsers": active_users,
         "purchases": purchases,
+        "rawPurchaseEvents": raw_purchase_events,
+        "duplicatePurchaseEvents": duplicate_purchase_events,
+        "duplicateTransactionIds": duplicate_transaction_ids,
+        "missingTransactionIdEvents": missing_transaction_id_events,
+        "purchaseMetric": (
+            "unique_transaction_id"
+            if any("transactions" in row for row in traffic_rows)
+            else "key_events"
+        ),
         "conversion": conversion,
+        "sessionPurchaseRate": session_purchase_rate,
         "start": start.isoformat() if start else None,
         "end": end.isoformat() if end else None,
         "errors": active_errors,
@@ -3992,7 +4274,7 @@ def build_data_reconciliation(
     ga4_status: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     shopline_orders = len(orders)
-    ga4_purchases = sum_optional_float(row.get("keyEvents") for row in ga4_rows)
+    ga4_purchases = ga4_purchase_count(ga4_rows)
     if ga4_purchases is None:
         status = str((ga4_status or {}).get("status") or "missing")
         label = str((ga4_status or {}).get("label") or "GA4 Purchase 暂无数据")
@@ -4003,9 +4285,16 @@ def build_data_reconciliation(
             "differenceRate": None,
             "status": status,
             "label": label,
+            "rawPurchaseEvents": (ga4_status or {}).get("rawPurchaseEvents"),
+            "duplicatePurchaseEvents": (ga4_status or {}).get("duplicatePurchaseEvents"),
+            "duplicateTransactionIds": (ga4_status or {}).get("duplicateTransactionIds"),
         }
     difference = shopline_orders - ga4_purchases
-    difference_rate = abs(difference) / shopline_orders * 100 if shopline_orders else 0
+    difference_rate = (
+        abs(difference) / shopline_orders * 100
+        if shopline_orders
+        else 100.0 if ga4_purchases else 0.0
+    )
     if difference_rate <= 5:
         status = "aligned"
         label = "数据基本一致"
@@ -4022,6 +4311,9 @@ def build_data_reconciliation(
         "differenceRate": round_number(difference_rate),
         "status": status,
         "label": label,
+        "rawPurchaseEvents": (ga4_status or {}).get("rawPurchaseEvents"),
+        "duplicatePurchaseEvents": (ga4_status or {}).get("duplicatePurchaseEvents"),
+        "duplicateTransactionIds": (ga4_status or {}).get("duplicateTransactionIds"),
     }
 
 
@@ -4031,6 +4323,8 @@ def build_sync_quality(
     product_result: dict[str, Any],
     channels: list[dict[str, Any]],
     errors: list[str],
+    reconciliation: dict[str, Any] | None = None,
+    ga4_status: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     total_orders = len(orders)
     attributed_orders = sum(
@@ -4058,6 +4352,17 @@ def build_sync_quality(
     score -= min(15, int(order_result.get("duplicateCount") or 0) * 0.5)
     if order_result.get("pageLimitReached"):
         score -= 20
+    if product_result.get("pageLimitReached"):
+        score -= 15
+    difference_rate = parse_optional_float((reconciliation or {}).get("differenceRate"))
+    if difference_rate is not None and difference_rate > 5:
+        score -= min(35, (difference_rate - 5) * 0.75)
+    duplicate_purchase_events = parse_int(
+        (ga4_status or {}).get("duplicatePurchaseEvents")
+    )
+    raw_purchase_events = parse_int((ga4_status or {}).get("rawPurchaseEvents"))
+    if raw_purchase_events > 0 and duplicate_purchase_events > 0:
+        score -= min(15, duplicate_purchase_events / raw_purchase_events * 30)
     return {
         "score": round_number(max(0, score)),
         "grade": "A" if score >= 90 else "B" if score >= 75 else "C" if score >= 60 else "D",
@@ -4069,6 +4374,14 @@ def build_sync_quality(
         "normalizedOrders": int(order_result.get("normalizedCount") or total_orders),
         "duplicateOrders": int(order_result.get("duplicateCount") or 0),
         "productCount": int(product_result.get("rawCount") or 0),
+        "productPages": int(product_result.get("pages") or 0),
+        "productPageLimitReached": bool(product_result.get("pageLimitReached")),
+        "ga4DifferenceRate": round_number(difference_rate) if difference_rate is not None else None,
+        "ga4RawPurchaseEvents": raw_purchase_events,
+        "ga4DuplicatePurchaseEvents": duplicate_purchase_events,
+        "ga4DuplicateTransactionIds": parse_int(
+            (ga4_status or {}).get("duplicateTransactionIds")
+        ),
         "attributionRate": round_number(attribution_rate),
         "officialAttributionOrders": official_attribution_orders,
         "officialAttributionRate": round_number(official_attribution_rate),
@@ -4195,6 +4508,26 @@ def build_profit_summary(
     platform_cost = payment_fee + shipping_cost
     estimated_profit = net_revenue - product_cost - platform_cost - ad_cost
     margin = (estimated_profit / net_revenue * 100) if net_revenue else 0.0
+    cost_coverage = configured_units / total_units * 100 if total_units else 0.0
+    shipping_configured = bool(shipping_costs) or costs.shipping_cost_per_order > 0
+    warnings = []
+    confidence_score = 100.0
+    if total_units and cost_coverage < 100:
+        confidence_score -= min(45, (100 - cost_coverage) * 0.45)
+        warnings.append(
+            f"SKU 精确成本仅覆盖 {round_number(cost_coverage)}%，其余按 {round_number(costs.product_cost_rate * 100)}% 成本率估算。"
+        )
+    if not shipping_configured:
+        confidence_score -= 25
+        warnings.append("物流成本未配置，当前按 0 计算。")
+    if ad_cost_source == "missing":
+        confidence_score -= 20
+        warnings.append("广告花费未接入，当前按 0 计算。")
+    confidence_score = max(0.0, confidence_score)
+    confidence = (
+        "high" if confidence_score >= 80 else "medium" if confidence_score >= 55 else "low"
+    )
+    confidence_label = {"high": "高可信", "medium": "中等可信", "low": "低可信"}[confidence]
     return {
         "revenue": round_number(gross_revenue),
         "grossRevenue": round_number(gross_revenue),
@@ -4214,12 +4547,18 @@ def build_profit_summary(
         "paymentFeeRate": round_number(costs.payment_fee_rate * 100),
         "shippingCostPerOrder": round_number(costs.shipping_cost_per_order),
         "skuCostCount": len(sku_costs),
-        "costCoverage": round_number(configured_units / total_units * 100) if total_units else 0,
+        "costCoverage": round_number(cost_coverage),
         "shippingMarketCount": len(shipping_costs),
+        "shippingConfigured": shipping_configured,
         "channelCount": len(channels),
+        "confidence": confidence,
+        "confidenceLabel": confidence_label,
+        "confidenceScore": round_number(confidence_score),
+        "warnings": warnings,
         "notes": [
             "已优先采用 SKU 成本，缺失 SKU 按默认成本率估算。",
             "净销售额已扣除接口返回的退款金额。",
+            *warnings,
         ],
     }
 
@@ -4971,7 +5310,11 @@ def build_alerts_v2(
         )
 
     latest_series = series[-1] if series else {}
-    ga4_key_events = parse_optional_float(latest_series.get("keyEvents"))
+    ga4_key_events = (
+        parse_optional_float(latest_series.get("transactions"))
+        if "transactions" in latest_series
+        else parse_optional_float(latest_series.get("keyEvents"))
+    )
     latest_order_count = parse_int(latest_series.get("orders"))
     if (
         ga4_key_events is not None
@@ -4983,7 +5326,7 @@ def build_alerts_v2(
             {
                 "level": "info",
                 "title": "GA4 转化延迟",
-                "message": f"GA4 purchase 记录 {round_number(ga4_key_events)} 次，Shopline 今日订单 {latest_order_count} 单，GA4 转化率可能存在延迟。",
+                "message": f"GA4 唯一交易 {round_number(ga4_key_events)} 笔，Shopline 今日订单 {latest_order_count} 单，GA4 可能存在上报延迟或交易 ID 缺失。",
             }
         )
 

@@ -17,6 +17,7 @@ const state = {
   campaignSearch: "",
   campaignCollapsed: localStorage.getItem("sosove-campaign-panel") !== "expanded",
   diagnosticTab: "missing",
+  channelDialogPage: 1,
   tableStates: {},
   tableConfigs: {},
   dismissedAlerts: new Set(readStoredArray("sosove-dismissed-alerts")),
@@ -28,6 +29,8 @@ const state = {
 const ORDER_PAGE_SIZE = 10;
 const DEFAULT_AUTO_REFRESH_MS = 300000;
 const STALE_REFRESH_AFTER_MS = 120000;
+const REQUEST_TIMEOUT_MS = 60000;
+const CHANNEL_DIALOG_PAGE_SIZE = 10;
 const AUTO_REFRESH_STORAGE_KEY = "sosove-auto-refresh-ms";
 
 const currencyFormatters = new Map();
@@ -178,6 +181,8 @@ function bindControls() {
   document.getElementById("channels").addEventListener("click", handleChannelPanelAction);
   document.getElementById("channel-dialog-close").addEventListener("click", closeChannelDialog);
   document.getElementById("channel-dialog-filter").addEventListener("click", filterChannelOrders);
+  document.getElementById("channel-dialog-prev").addEventListener("click", () => changeChannelDialogPage(-1));
+  document.getElementById("channel-dialog-next").addEventListener("click", () => changeChannelDialogPage(1));
   document.getElementById("channel-order-dialog").addEventListener("click", (event) => {
     if (event.target === event.currentTarget) closeChannelDialog();
   });
@@ -236,22 +241,45 @@ async function fetchJson(path, options = {}) {
   if (!skipAuth && state.authToken) {
     headers["X-Dashboard-Token"] = state.authToken;
   }
-  const response = await fetch(path, {
-    ...fetchOptions,
-    cache: "no-store",
-    headers,
-  });
-  const text = await response.text();
-  const data = text ? JSON.parse(text) : {};
-  if (!response.ok) {
-    if (response.status === 401 && state.authConfigured) {
-      state.authToken = "";
-      sessionStorage.removeItem("sosove-dashboard-token");
-      showAuthGate();
-    }
-    throw new Error(data.error || response.statusText);
+  const requestController = new AbortController();
+  const externalSignal = fetchOptions.signal;
+  let timedOut = false;
+  const abortFromCaller = () => requestController.abort(externalSignal?.reason);
+  if (externalSignal) {
+    if (externalSignal.aborted) abortFromCaller();
+    else externalSignal.addEventListener("abort", abortFromCaller, { once: true });
   }
-  return data;
+  const timeoutId = window.setTimeout(() => {
+    timedOut = true;
+    requestController.abort();
+  }, REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(path, {
+      ...fetchOptions,
+      signal: requestController.signal,
+      cache: "no-store",
+      headers,
+    });
+    const text = await response.text();
+    const data = text ? JSON.parse(text) : {};
+    if (!response.ok) {
+      if (response.status === 401 && state.authConfigured) {
+        state.authToken = "";
+        sessionStorage.removeItem("sosove-dashboard-token");
+        showAuthGate();
+      }
+      throw new Error(data.error || response.statusText);
+    }
+    return data;
+  } catch (error) {
+    if (timedOut) {
+      throw new Error("数据请求超过 60 秒，请检查 Shopline / GA4 接口后重试。");
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeoutId);
+    externalSignal?.removeEventListener("abort", abortFromCaller);
+  }
 }
 
 function render(payload) {
@@ -261,7 +289,9 @@ function render(payload) {
   setText("range-caption", formatRangeCaption(payload.range));
   setText("mobile-range-caption", formatRangeCaption(payload.range));
   const loadSeconds = Number(payload.source.loadMs || 0) / 1000;
-  setText("source-badge", `${payload.source.cached ? "缓存" : "实时"} · ${loadSeconds ? `${formatNumber(loadSeconds)}s` : payload.source.label}`);
+  setText("source-badge", payload.source.cached
+    ? `缓存快照 · ${formatDateTime(payload.source.syncedAt)}`
+    : `${payload.source.mode === "live" ? "实时" : payload.source.label} · ${loadSeconds ? `${formatNumber(loadSeconds)}s` : "已完成"}`);
   setText("last-sync", formatDateTime(payload.source.syncedAt));
   renderStatusRail(payload);
   renderConnector(payload);
@@ -528,6 +558,9 @@ function renderDataTrust(reconciliation = {}, quality = {}, campaigns = {}, diag
   const ga4Context = ga4Status.sessions === null || ga4Status.sessions === undefined
     ? ""
     : ` · GA4 ${formatNumber(ga4Status.sessions)} 会话`;
+  const purchaseContext = ga4Status.rawPurchaseEvents === null || ga4Status.rawPurchaseEvents === undefined
+    ? ""
+    : ` · 原始 Purchase ${formatNumber(ga4Status.rawPurchaseEvents)} 次，剔除重复 ${formatNumber(ga4Status.duplicatePurchaseEvents || 0)} 次`;
   const missingNote = ga4Status.status === "error"
     ? (ga4Status.errors?.[0] || "GA4 查询异常，请点击接口测试查看。")
     : ga4Status.status === "unconfigured"
@@ -537,7 +570,7 @@ function renderDataTrust(reconciliation = {}, quality = {}, campaigns = {}, diag
         : "等待 GA4 Purchase 数据完成对账。";
   setText("reconcile-note", difference === null || difference === undefined
     ? missingNote
-    : `相差 ${formatNumber(Math.abs(difference))} 单 · 差异率 ${formatOptionalPercent(reconciliation.differenceRate)}${ga4Context}`);
+    : `相差 ${formatNumber(Math.abs(difference))} 单 · 差异率 ${formatOptionalPercent(reconciliation.differenceRate)}${ga4Context}${purchaseContext}`);
   const statusNode = document.getElementById("reconcile-status");
   statusNode.className = `status-pill reconcile-${reconciliation.status || "missing"}`;
   statusNode.title = ga4Status.errors?.join("\n") || ga4Status.label || "GA4 Data API";
@@ -547,9 +580,11 @@ function renderDataTrust(reconciliation = {}, quality = {}, campaigns = {}, diag
   meter.style.width = `${Math.max(0, Math.min(100, Number(quality.score) || 0))}%`;
   document.getElementById("quality-facts").innerHTML = [
     ["抓取页数", `${formatNumber(quality.orderPages || 0)} / ${formatNumber(quality.orderChunks || 1)} 段`],
+    ["商品抓取", `${formatNumber(quality.productCount || 0)} 个 / ${formatNumber(quality.productPages || 0)} 页`],
     ["原始订单", quality.rawOrders],
     ["重复剔除", quality.duplicateOrders],
-    ["分页状态", quality.pageLimitReached ? "达到上限" : "完整"],
+    ["GA4 重复事件", quality.ga4DuplicatePurchaseEvents || 0],
+    ["分页状态", quality.pageLimitReached || quality.productPageLimitReached ? "达到上限" : "完整"],
   ].map(([label, value]) => `<div><span>${label}</span><strong>${typeof value === "number" ? formatNumber(value) : escapeHtml(value)}</strong></div>`).join("");
 
   setText("campaign-coverage", formatOptionalPercent(campaigns.coverage));
@@ -735,10 +770,15 @@ function renderChannels(channels, currency, analytics = {}) {
   const safeChannels = Array.isArray(channels) ? channels : [];
   setText("channel-mode", analytics.label || "Shopline 订单归因");
   setText("channel-sessions", analytics.sessions ? formatNumber(analytics.sessions) : "--");
+  const channelSessions = document.getElementById("channel-sessions");
+  channelSessions.title = analytics.sessionsNormalized
+    ? `GA4 渠道维度原始会话不可直接相加，已按渠道占比校准至总会话 ${formatNumber(analytics.ga4TotalSessions || 0)}`
+    : "GA4 官方会话数";
   setText("channel-order-rate", formatOptionalPercent(analytics.orderAttributionRate));
   setText("channel-official-rate", formatOptionalPercent(analytics.officialAttributionRate));
   setText("channel-smartpush-orders", `${formatNumber(analytics.smartPushOrders || 0)} 单`);
   setText("channel-smartpush-revenue", formatCurrency(analytics.smartPushRevenue || 0, currency));
+  renderFocusChannels(safeChannels, currency);
 
   renderManagedTable({
     tableId: "channel-table",
@@ -778,6 +818,33 @@ function renderChannels(channels, currency, analytics = {}) {
   });
 }
 
+function renderFocusChannels(channels, currency) {
+  const definitions = [
+    { channel: "LINE", label: "LINE" },
+    { channel: "Yahoo", label: "Yahoo" },
+    { channel: "Organic", label: "自然流量" },
+  ];
+  const lookup = new Map(channels.map((row) => [row.channel, row]));
+  document.querySelectorAll(".focus-channel-card").forEach((card, index) => {
+    const definition = definitions[index];
+    const row = lookup.get(definition.channel) || {
+      channel: definition.channel,
+      orders: 0,
+      revenue: 0,
+      officialOrders: 0,
+      orderDetails: [],
+      orderDetailCount: 0,
+      sessions: 0,
+      activeUsers: 0,
+    };
+    card.dataset.channelDrill = definition.channel;
+    card.querySelector("strong").textContent = `${formatNumber(row.orders || 0)} 单`;
+    card.querySelector("small").textContent = `${formatCurrency(row.revenue || 0, currency)} · 官方 ${formatNumber(row.officialOrders || 0)} 单`;
+    card.classList.toggle("has-orders", Number(row.orders) > 0);
+    card.title = Number(row.orders) > 0 ? `查看 ${definition.label} 全部订单` : `${definition.label} 当前暂无订单`;
+  });
+}
+
 function renderChannelConversion(channel) {
   if (!channel.sessions) {
     return '<span class="utm-empty">GA4 待同步</span>';
@@ -797,14 +864,24 @@ function renderChannelConversion(channel) {
 function handleChannelPanelAction(event) {
   const button = event.target.closest("[data-channel-drill]");
   if (!button || !state.payload) return;
-  const channel = (state.payload.channels || []).find((row) => row.channel === button.dataset.channelDrill);
-  if (!channel) return;
+  const channelName = button.dataset.channelDrill;
+  const channel = (state.payload.channels || []).find((row) => row.channel === channelName) || {
+    channel: channelName,
+    orders: 0,
+    officialOrders: 0,
+    revenue: 0,
+    sessions: 0,
+    activeUsers: 0,
+    orderDetails: [],
+    orderDetailCount: 0,
+  };
   openChannelDialog(channel, state.payload.currency);
 }
 
 function openChannelDialog(channel, currency) {
   const dialog = document.getElementById("channel-order-dialog");
   dialog.dataset.channel = channel.channel;
+  state.channelDialogPage = 1;
   setText("channel-dialog-title", `${channel.channel} 订单核对`);
   setText("channel-dialog-subtitle", `${formatNumber(channel.sessions || 0)} 会话 · ${formatNumber(channel.activeUsers || 0)} 用户`);
   setText("channel-dialog-orders", `${formatNumber(channel.orders || 0)} 单`);
@@ -813,8 +890,23 @@ function openChannelDialog(channel, currency) {
   setText("channel-dialog-shopline-rate", formatOptionalPercent(channel.shoplineConversion));
   setText("channel-dialog-ga4-rate", formatOptionalPercent(channel.ga4Conversion));
   setText("channel-dialog-note", channel.conversionNote || "SHOPLINE 订单与 GA4 会话的跨系统核对");
-  setText("channel-dialog-count", `显示最近 ${formatNumber((channel.orderDetails || []).length)} 笔 · 渠道共 ${formatNumber(channel.orderDetailCount || channel.orders || 0)} 单`);
-  const rows = (channel.orderDetails || []).map((order) => {
+  renderChannelDialogOrders(channel, currency);
+  if (typeof dialog.showModal === "function") dialog.showModal();
+}
+
+function renderChannelDialogOrders(channel, currency) {
+  const allOrders = Array.isArray(channel.orderDetails) ? channel.orderDetails : [];
+  const totalPages = Math.max(1, Math.ceil(allOrders.length / CHANNEL_DIALOG_PAGE_SIZE));
+  state.channelDialogPage = Math.max(1, Math.min(totalPages, state.channelDialogPage));
+  const start = (state.channelDialogPage - 1) * CHANNEL_DIALOG_PAGE_SIZE;
+  const pageOrders = allOrders.slice(start, start + CHANNEL_DIALOG_PAGE_SIZE);
+  setText("channel-dialog-count", allOrders.length
+    ? `显示 ${start + 1}–${Math.min(allOrders.length, start + pageOrders.length)} / ${formatNumber(allOrders.length)} 笔`
+    : "当前来源暂无订单");
+  setText("channel-dialog-page", allOrders.length ? `第 ${state.channelDialogPage} / ${totalPages} 页` : "第 0 / 0 页");
+  document.getElementById("channel-dialog-prev").disabled = state.channelDialogPage <= 1;
+  document.getElementById("channel-dialog-next").disabled = state.channelDialogPage >= totalPages || !allOrders.length;
+  const rows = pageOrders.map((order) => {
     const tracking = [order.utmSource, order.utmMedium].filter(Boolean).join(" / ");
     const attribution = order.attributionMethod === "shopline_attribution" ? "SHOPLINE 官方" : (order.attributionMethod || "字段推断");
     return `
@@ -829,7 +921,14 @@ function openChannelDialog(channel, currency) {
     `;
   }).join("");
   document.getElementById("channel-dialog-order-rows").innerHTML = rows || '<tr><td colspan="6" class="empty">暂无订单明细</td></tr>';
-  if (typeof dialog.showModal === "function") dialog.showModal();
+}
+
+function changeChannelDialogPage(delta) {
+  const dialog = document.getElementById("channel-order-dialog");
+  const channel = (state.payload?.channels || []).find((row) => row.channel === dialog.dataset.channel);
+  if (!channel) return;
+  state.channelDialogPage += delta;
+  renderChannelDialogOrders(channel, state.payload.currency);
 }
 
 function closeChannelDialog() {
@@ -910,7 +1009,7 @@ function channelClass(value) {
 function renderProfit(profit, currency) {
   if (!profit) return;
   setText("profit-main", formatCurrency(profit.estimatedProfit, currency));
-  setText("profit-margin", `利润率 ${formatPercent(profit.margin)}`);
+  setText("profit-margin", `利润率 ${formatPercent(profit.margin)} · ${profit.confidenceLabel || "待评估"}`);
   setText("profit-adcost", formatCurrency(profit.adCost, currency));
   setText("profit-platform", formatCurrency(profit.platformCost, currency));
   setText("profit-product-cost", formatCurrency(profit.productCost, currency));
@@ -921,6 +1020,9 @@ function renderProfit(profit, currency) {
   setText("profit-fee-rate", `${formatNumber(profit.paymentFeeRate)}%`);
   setText("profit-shipping", formatCurrency(profit.shippingCostPerOrder, currency));
   setText("profit-note", (profit.notes || []).join(" "));
+  const marginBadge = document.getElementById("profit-margin");
+  marginBadge.dataset.confidence = profit.confidence || "low";
+  marginBadge.title = `估算可信度 ${formatNumber(profit.confidenceScore || 0)} / 100`;
 }
 
 function renderAdPerformance(rows, currency) {
@@ -1677,8 +1779,9 @@ function setBusy(isBusy) {
     progress.hidden = !isBusy;
     progress.classList.toggle("active", isBusy);
   }
-  document.querySelectorAll("button, input, select").forEach((control) => {
-    if (control.id === "theme-toggle" || control.closest("#auth-gate")) return;
+  ["sync-btn", "test-connector-btn"].forEach((id) => {
+    const control = document.getElementById(id);
+    if (!control) return;
     if (isBusy) {
       if (!Object.hasOwn(control.dataset, "busyWasDisabled")) {
         control.dataset.busyWasDisabled = control.disabled ? "1" : "0";
@@ -1857,7 +1960,7 @@ function scheduleAutoRefresh(intervalMs, { announce = true, persist = false } = 
 
 function bindFreshnessRefresh() {
   const refreshWhenVisible = () => {
-    if (document.hidden || state.busy || !state.payload) return;
+    if (!state.autoRefreshMs || document.hidden || state.busy || !state.payload) return;
     const syncedAt = new Date(state.payload.source?.syncedAt || 0).getTime();
     const baseline = Number.isFinite(syncedAt) && syncedAt > 0 ? syncedAt : state.lastRenderedAt;
     if (Date.now() - baseline < STALE_REFRESH_AFTER_MS) return;
