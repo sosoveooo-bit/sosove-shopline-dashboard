@@ -49,6 +49,11 @@ jobs:
       - name: Check NAS restrictive source permissions on ARM64
         run: bash deploy/test_image_permissions.sh
 
+      - name: Test encrypted GA4 import on ARM64 with synthetic credentials
+        run: |
+          python -m pip install cryptography
+          sudo "$(command -v python)" -m deploy.smoke_ga4_import --image sosove-shopline-dashboard:local
+
   build-and-push:
     needs: arm64-check
     runs-on: ubuntu-latest
@@ -123,6 +128,9 @@ jobs:
 
       - name: Check restrictive source permissions on AMD64
         run: bash deploy/test_image_permissions.sh
+
+      - name: Test encrypted GA4 import with synthetic credentials
+        run: sudo "$(command -v python)" -m deploy.smoke_ga4_import --image sosove-dashboard:smoke
 
       - name: Build and push
         uses: docker/build-push-action@v6

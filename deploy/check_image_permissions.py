@@ -17,6 +17,7 @@ for path in [root / "app.py", *[path for path in package.rglob("*") if path.is_f
         stream.read(1)
 assert not (root / ".env").exists()
 assert not (root / "secrets" / "ga.json").exists()
+assert not (root / "deploy" / "encrypted").exists()
 import app  # noqa: E402
 
 assert app.app is not None

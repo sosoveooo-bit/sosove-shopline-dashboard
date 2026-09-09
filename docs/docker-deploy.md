@@ -156,6 +156,24 @@ GA4_SERVICE_ACCOUNT_JSON=
 
 ## 4. 上传 GA4 私钥（仅使用 GA4 时）
 
+### 已获得加密导入包和单独口令时
+
+仓库中的 `deploy/encrypted/ga4-transfer.fernet` 是经过所有者授权发布的加密文件，不是明文私钥。没有单独的解密口令不能导入；口令不放在 GitHub、Docker 镜像或命令参数中。
+
+NAS 的 root SSH 终端执行：
+
+```bash
+cd /vol1/sosove-dashboard-docker && git pull --ff-only && python3 -m deploy.ga4_transfer import
+```
+
+出现 `GA4 解密口令（隐藏输入）` 后，粘贴单独收到的口令并回车。这不是面板密码，也不是 Shopline Token。
+
+命令会从本地现有镜像创建无网络、禁用日志的临时解密容器，通过内存管道验证并解密，然后设置私钥文件权限、备份和更新 `.env`、重新创建面板容器。它不需要在 NAS 系统上安装 `cryptography` 或手动上传私钥。原 Shopline 配置和访问端口保留。
+
+导入后刷新网页并点“接口测试”，确认服务账号对 GA4 属性仍有权限。不要把解密口令、解密后的 `ga.json` 或 `.env` 上传到公开仓库。若口令泄漏，应在 Google Cloud 撤销/轮换服务账号私钥，单纯删除 GitHub 上的密文不能清除历史记录。
+
+### 普通文件上传方式
+
 在你的 Windows PowerShell 中执行，替换本机文件和 VPS IP：
 
 ```powershell

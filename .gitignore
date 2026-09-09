@@ -16,3 +16,5 @@ shopline_monitor/runtime_logs/
 *.p12
 *credentials*.json
 ga.json
+*transfer-code*.txt
+*.transfer-code
