@@ -12,6 +12,32 @@
 
 如果 VPS 已运行旧版 Python/systemd 面板或 Nginx，先在新的 `/opt/sosove-dashboard-docker` 目录、8000 端口测试。本教程不会自动停掉旧服务、替换 80 端口或迁移旧配置。
 
+## 最简单：一条命令安装
+
+在 Ubuntu VPS 的 **root SSH 终端**执行下面一行。该命令下载并以 root 权限运行本仓库的[安装脚本](../deploy/install_docker.sh)，会安装缺少的 Docker/Compose、git、python3 辅助工具，并构建运行容器。可以先打开脚本查看内容。
+
+```bash
+(sosove_installer=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/sosoveooo-bit/sosove-shopline-dashboard/main/deploy/install_docker.sh -o "$sosove_installer" && bash "$sosove_installer")
+```
+
+要求：Ubuntu 22.04/24.04/26.04，已有 curl，能访问 GitHub、Docker 官方源、Docker Hub 和 Python 包源。已经有正常 Docker 环境时直接复用；检测到不兼容的既有 Docker/containerd 时会停止提示，不自动卸载其他服务。
+
+按提示输入：
+
+1. Shopline 店铺域名，例如 `jp-sosove.myshopline.com`。
+2. Shopline API Token，输入不回显。
+3. 自己设置的面板登录密码，至少 16 位，输入不回显。
+4. 访问端口，回车使用 `8000`。
+5. 绑定地址：公网 IP 访问填 `0.0.0.0`；仅本机/Nginx/SSH 隧道访问回车即可。
+
+公网模式安装完成后，浏览器打开 `http://你的VPS公网IP:8000/`（按实际端口替换），云安全组放行该端口并限制访问来源。HTTP 不加密密码和订单，长期使用应配置 HTTPS。仅本机模式下，脚本会显示 SSH 隧道命令。
+
+一键安装使用源码构建，**不需要 GHCR 登录密码**。目录是 `/opt/sosove-dashboard-docker-source`；重复执行会更新干净的 main 分支、保留 `.env`、密钥和快照卷。不会自动停止旧面板或修改 Nginx。若端口已占用，脚本停止并提示更换端口，不杀掉其他程序。
+
+GA4 不是安装必填项；已有 `.env` 中的 GA4 设置会保留，新安装先启用 Shopline。补充 GA4 时按第 4 节操作，**把示例中的部署目录改成 `/opt/sosove-dashboard-docker-source`**。一键脚本不会把 Windows 私钥自动上传到 VPS。
+
+不使用一键脚本时，再按下面分步教程操作，两种方式选一种即可。
+
 ## 1. 确认 Docker 已安装
 
 通过 SSH 登录 VPS。后续 VPS 命令按 root 用户编写，普通用户需要相应的 sudo 权限。

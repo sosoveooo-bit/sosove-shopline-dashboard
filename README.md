@@ -4,6 +4,16 @@ A small full-stack dashboard for monitoring Shopline store data.
 
 ## Docker 部署入口
 
+### 一条命令安装
+
+在 Ubuntu 22.04/24.04/26.04 的 **root SSH 终端**执行（需要能访问 GitHub 和已安装 curl）：
+
+```bash
+(sosove_installer=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/sosoveooo-bit/sosove-shopline-dashboard/main/deploy/install_docker.sh -o "$sosove_installer" && bash "$sosove_installer")
+```
+
+命令会以 root 权限运行本仓库的[安装脚本](deploy/install_docker.sh)，自动安装缺少的 Docker 组件、下载源码、询问配置并构建启动。Shopline Token 和面板密码由你输入；公网 IP 访问时按提示填写 `0.0.0.0` 并在云安全组放行所选端口，默认 `8000`。默认安装目录为 `/opt/sosove-dashboard-docker-source`。已有配置会保留，旧 Nginx/systemd 面板不会被停止；GA4 私钥可以稍后按教程配置。
+
 完整中文教程：[Ubuntu VPS Docker 部署](docs/docker-deploy.md)
 
 最新版本包含 SmartPush 点击查看订单、Yahoo 合并订单分页、GA4 同口径周期转化率，以及后台快照更新。容器与本地面板使用同一套后端逻辑。
