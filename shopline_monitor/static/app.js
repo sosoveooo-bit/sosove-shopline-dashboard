@@ -1,6 +1,8 @@
 const state = {
   range: "7d",
   date: "",
+  followToday: true,
+  storeTimezone: "Asia/Shanghai",
   payload: null,
   busy: false,
   theme: document.documentElement.dataset.theme || "dark",
@@ -51,6 +53,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   syncToolbarDisclosure();
   initScrollTopButton();
   bindFreshnessRefresh();
+  bindTodayRollover();
   window.addEventListener("resize", syncToolbarDisclosure);
   await initializeAccess();
 });
@@ -64,6 +67,7 @@ function bindControls() {
     button.addEventListener("click", () => {
       state.range = button.dataset.range;
       state.date = "";
+      state.followToday = false;
       document.getElementById("date-picker").value = "";
       updateControlState();
       loadDashboard();
@@ -72,6 +76,7 @@ function bindControls() {
 
   document.getElementById("today-btn").addEventListener("click", () => {
     state.range = "1d";
+    state.followToday = true;
     state.date = localDateString();
     document.getElementById("date-picker").value = state.date;
     updateControlState();
@@ -99,6 +104,7 @@ function bindControls() {
     if (!event.target.value) return;
     state.range = "1d";
     state.date = event.target.value;
+    state.followToday = false;
     updateControlState();
     loadDashboard();
   });
@@ -214,17 +220,36 @@ function initScrollTopButton() {
 }
 
 async function loadDashboard({ force = false, announce = false } = {}) {
+  if (refreshTodaySelection()) updateControlState();
   const request = beginRequest();
   try {
-    const payload = force
+    let payload = force
       ? await fetchJson("/api/sync", {
         method: "POST",
-        body: JSON.stringify(currentQueryPayload()),
+        body: JSON.stringify({ ...currentQueryPayload(), background: true }),
         signal: request.signal,
       })
       : await fetchJson(metricsPath(), { signal: request.signal });
-    if (request.id !== state.activeRequestSeq) return;
-    render(payload);
+    const started = Date.now();
+    while (true) {
+      if (request.id !== state.activeRequestSeq) return;
+      if (!payload.pending && payload.kpis) {
+        const revision = (item) => JSON.stringify([item?.range, item?.filters?.active, item?.source?.syncedAt]);
+        if (revision(payload) !== revision(state.payload)) render(payload);
+      }
+      if (payload.refresh?.error) throw new Error(payload.refresh.error);
+      if (!payload.refresh?.running) break;
+      setText("source-badge", payload.pending
+        ? "所选日期同步中 · 等待接口返回"
+        : `后台更新中 · 上次成功 ${formatDateTime(payload.source.syncedAt)}`);
+      if (Date.now() - started > 120000) throw new Error("后台同步仍在进行，现有数据已保留，请稍后刷新查看。");
+      await waitForDashboardPoll(request.signal, payload.refresh.retryAfterMs || 2000);
+      payload = await fetchJson(metricsPath(), { signal: request.signal });
+    }
+    if (payload.pending) throw new Error("所选日期暂无可用快照，请重试同步。");
+    if (payload.source) {
+      setText("source-badge", `${payload.source.label || "实时接口数据"} · ${formatDateTime(payload.source.syncedAt)}`);
+    }
     if (announce) showToast("Shopline 与 GA4 同步完成");
   } catch (error) {
     if (error.name !== "AbortError") {
@@ -282,8 +307,27 @@ async function fetchJson(path, options = {}) {
   }
 }
 
+function waitForDashboardPoll(signal, milliseconds) {
+  return new Promise((resolve, reject) => {
+    const abort = () => {
+      window.clearTimeout(timer);
+      signal.removeEventListener("abort", abort);
+      const error = new Error("Request superseded");
+      error.name = "AbortError";
+      reject(error);
+    };
+    const timer = window.setTimeout(() => {
+      signal.removeEventListener("abort", abort);
+      resolve();
+    }, Math.min(5000, Math.max(500, milliseconds)));
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+  });
+}
+
 function render(payload) {
   state.payload = payload;
+  state.storeTimezone = payload.source.timezone || state.storeTimezone;
   state.lastRenderedAt = Date.now();
   setHidden("error-panel", true);
   setText("range-caption", formatRangeCaption(payload.range));
@@ -307,7 +351,13 @@ function render(payload) {
   );
   renderAttributionDiagnostics(payload.attributionDiagnostics, payload.currency);
   renderChart(payload.series, payload.currency);
-  renderChannels(payload.channels, payload.currency, payload.channelAnalytics);
+  renderChannels(payload.channels, payload.currency, payload.channelAnalytics, payload.focusChannels);
+  const channelDialog = document.getElementById("channel-order-dialog");
+  if (channelDialog.open) {
+    const row = findChannelRow(channelDialog.dataset.channel, channelDialog.dataset.scope === "focus");
+    if (row) renderChannelDialog(row, payload.currency);
+    else closeChannelDialog();
+  }
   renderCampaigns(payload.campaigns, payload.currency);
   renderProfit(payload.profit, payload.currency);
   renderAdPerformance(payload.adPerformance, payload.currency);
@@ -561,6 +611,9 @@ function renderDataTrust(reconciliation = {}, quality = {}, campaigns = {}, diag
   const purchaseContext = ga4Status.rawPurchaseEvents === null || ga4Status.rawPurchaseEvents === undefined
     ? ""
     : ` · 原始 Purchase ${formatNumber(ga4Status.rawPurchaseEvents)} 次，剔除重复 ${formatNumber(ga4Status.duplicatePurchaseEvents || 0)} 次`;
+  const aliasContext = ga4Status.aliasDuplicateTransactionIds
+    ? `，合并双重交易 ID ${formatNumber(ga4Status.aliasDuplicateTransactionIds)} 个`
+    : "";
   const missingNote = ga4Status.status === "error"
     ? (ga4Status.errors?.[0] || "GA4 查询异常，请点击接口测试查看。")
     : ga4Status.status === "unconfigured"
@@ -570,7 +623,7 @@ function renderDataTrust(reconciliation = {}, quality = {}, campaigns = {}, diag
         : "等待 GA4 Purchase 数据完成对账。";
   setText("reconcile-note", difference === null || difference === undefined
     ? missingNote
-    : `相差 ${formatNumber(Math.abs(difference))} 单 · 差异率 ${formatOptionalPercent(reconciliation.differenceRate)}${ga4Context}${purchaseContext}`);
+    : `相差 ${formatNumber(Math.abs(difference))} 单 · 差异率 ${formatOptionalPercent(reconciliation.differenceRate)}${ga4Context}${purchaseContext}${aliasContext}`);
   const statusNode = document.getElementById("reconcile-status");
   statusNode.className = `status-pill reconcile-${reconciliation.status || "missing"}`;
   statusNode.title = ga4Status.errors?.join("\n") || ga4Status.label || "GA4 Data API";
@@ -716,6 +769,9 @@ async function initializeAccess() {
     const status = await fetchJson("/api/auth/status", { skipAuth: true });
     state.authConfigured = Boolean(status.configured);
     state.role = status.role || "admin";
+    state.storeTimezone = status.timezone || state.storeTimezone;
+    refreshTodaySelection();
+    updateControlState();
     if (state.authConfigured && !state.authToken) {
       showAuthGate();
       return;
@@ -766,7 +822,7 @@ function applyRolePermissions() {
   });
 }
 
-function renderChannels(channels, currency, analytics = {}) {
+function renderChannels(channels, currency, analytics = {}, focusChannels = []) {
   const safeChannels = Array.isArray(channels) ? channels : [];
   setText("channel-mode", analytics.label || "Shopline 订单归因");
   setText("channel-sessions", analytics.sessions ? formatNumber(analytics.sessions) : "--");
@@ -778,7 +834,7 @@ function renderChannels(channels, currency, analytics = {}) {
   setText("channel-official-rate", formatOptionalPercent(analytics.officialAttributionRate));
   setText("channel-smartpush-orders", `${formatNumber(analytics.smartPushOrders || 0)} 单`);
   setText("channel-smartpush-revenue", formatCurrency(analytics.smartPushRevenue || 0, currency));
-  renderFocusChannels(safeChannels, currency);
+  renderFocusChannels(safeChannels, currency, focusChannels);
 
   renderManagedTable({
     tableId: "channel-table",
@@ -818,15 +874,17 @@ function renderChannels(channels, currency, analytics = {}) {
   });
 }
 
-function renderFocusChannels(channels, currency) {
+function renderFocusChannels(channels, currency, focusChannels = []) {
   const definitions = [
     { channel: "LINE", label: "LINE" },
     { channel: "Yahoo", label: "Yahoo" },
     { channel: "Organic", label: "自然流量" },
+    { channel: "Direct", label: "Direct" },
   ];
-  const lookup = new Map(channels.map((row) => [row.channel, row]));
-  document.querySelectorAll(".focus-channel-card").forEach((card, index) => {
-    const definition = definitions[index];
+  const lookup = new Map([...channels, ...(Array.isArray(focusChannels) ? focusChannels : [])].map((row) => [row.channel, row]));
+  document.querySelectorAll(".focus-channel-card").forEach((card) => {
+    const definition = definitions.find((item) => item.channel === card.dataset.channelDrill);
+    if (!definition) return;
     const row = lookup.get(definition.channel) || {
       channel: definition.channel,
       orders: 0,
@@ -839,7 +897,11 @@ function renderFocusChannels(channels, currency) {
     };
     card.dataset.channelDrill = definition.channel;
     card.querySelector("strong").textContent = `${formatNumber(row.orders || 0)} 单`;
-    card.querySelector("small").textContent = `${formatCurrency(row.revenue || 0, currency)} · 官方 ${formatNumber(row.officialOrders || 0)} 单`;
+    card.querySelector("small").textContent = row.focusSummary
+      ? `${formatCurrency(row.revenue || 0, currency)} · ${row.focusSummary}`
+      : row.virtual
+        ? `${formatCurrency(row.revenue || 0, currency)} · 无跟踪 ${formatNumber(row.orders || 0)} 单`
+        : `${formatCurrency(row.revenue || 0, currency)} · 官方 ${formatNumber(row.officialOrders || 0)} 单`;
     card.classList.toggle("has-orders", Number(row.orders) > 0);
     card.title = Number(row.orders) > 0 ? `查看 ${definition.label} 全部订单` : `${definition.label} 当前暂无订单`;
   });
@@ -865,7 +927,7 @@ function handleChannelPanelAction(event) {
   const button = event.target.closest("[data-channel-drill]");
   if (!button || !state.payload) return;
   const channelName = button.dataset.channelDrill;
-  const channel = (state.payload.channels || []).find((row) => row.channel === channelName) || {
+  const channel = findChannelRow(channelName, button.classList.contains("focus-channel-card")) || {
     channel: channelName,
     orders: 0,
     officialOrders: 0,
@@ -875,14 +937,27 @@ function handleChannelPanelAction(event) {
     orderDetails: [],
     orderDetailCount: 0,
   };
-  openChannelDialog(channel, state.payload.currency);
+  openChannelDialog(channel, state.payload.currency, button.classList.contains("focus-channel-card"));
 }
 
-function openChannelDialog(channel, currency) {
+function findChannelRow(channelName, preferFocus = false) {
+  const channelRows = state.payload?.channels || [];
+  const focusRows = state.payload?.focusChannels || [];
+  const rows = preferFocus ? [...focusRows, ...channelRows] : [...channelRows, ...focusRows];
+  return rows.find((row) => row.channel === channelName);
+}
+
+function openChannelDialog(channel, currency, preferFocus = false) {
   const dialog = document.getElementById("channel-order-dialog");
   dialog.dataset.channel = channel.channel;
+  dialog.dataset.scope = preferFocus ? "focus" : "channel";
   state.channelDialogPage = 1;
-  setText("channel-dialog-title", `${channel.channel} 订单核对`);
+  renderChannelDialog(channel, currency);
+  if (typeof dialog.showModal === "function" && !dialog.open) dialog.showModal();
+}
+
+function renderChannelDialog(channel, currency) {
+  setText("channel-dialog-title", `${channel.label || channel.channel} 订单核对`);
   setText("channel-dialog-subtitle", `${formatNumber(channel.sessions || 0)} 会话 · ${formatNumber(channel.activeUsers || 0)} 用户`);
   setText("channel-dialog-orders", `${formatNumber(channel.orders || 0)} 单`);
   setText("channel-dialog-revenue", formatCurrency(channel.revenue || 0, currency));
@@ -890,8 +965,8 @@ function openChannelDialog(channel, currency) {
   setText("channel-dialog-shopline-rate", formatOptionalPercent(channel.shoplineConversion));
   setText("channel-dialog-ga4-rate", formatOptionalPercent(channel.ga4Conversion));
   setText("channel-dialog-note", channel.conversionNote || "SHOPLINE 订单与 GA4 会话的跨系统核对");
+  document.getElementById("channel-dialog-filter").hidden = Boolean(channel.virtual);
   renderChannelDialogOrders(channel, currency);
-  if (typeof dialog.showModal === "function") dialog.showModal();
 }
 
 function renderChannelDialogOrders(channel, currency) {
@@ -925,7 +1000,7 @@ function renderChannelDialogOrders(channel, currency) {
 
 function changeChannelDialogPage(delta) {
   const dialog = document.getElementById("channel-order-dialog");
-  const channel = (state.payload?.channels || []).find((row) => row.channel === dialog.dataset.channel);
+  const channel = findChannelRow(dialog.dataset.channel, dialog.dataset.scope === "focus");
   if (!channel) return;
   state.channelDialogPage += delta;
   renderChannelDialogOrders(channel, state.payload.currency);
@@ -938,7 +1013,9 @@ function closeChannelDialog() {
 
 function filterChannelOrders() {
   const dialog = document.getElementById("channel-order-dialog");
-  const channel = dialog.dataset.channel || "";
+  const focusRow = findChannelRow(dialog.dataset.channel, true);
+  const merged = dialog.dataset.scope === "focus" && Boolean(focusRow?.focusSummary);
+  const channel = (merged ? "focus:" : "") + (dialog.dataset.channel || "");
   const sourceSelect = document.getElementById("order-source-filter");
   if (sourceSelect && [...sourceSelect.options].some((option) => option.value === channel)) {
     state.orderSource = channel;
@@ -1243,6 +1320,9 @@ function renderOrders(orders, currency, range) {
 }
 
 function filterOrders(orders) {
+  const focusIds = state.orderSource.startsWith("focus:")
+    ? new Set((findChannelRow(state.orderSource.slice(6), true)?.orderDetails || []).map((order) => order.id))
+    : null;
   return (orders || []).filter((order) => {
     const haystack = [
       order.id,
@@ -1253,7 +1333,7 @@ function filterOrders(orders) {
       order.fulfillmentStatus,
     ].join(" ").toLowerCase();
     if (state.orderSearch && !haystack.includes(state.orderSearch)) return false;
-    if (state.orderSource && order.source !== state.orderSource) return false;
+    if (focusIds ? !focusIds.has(order.id) : state.orderSource && order.source !== state.orderSource) return false;
     if (state.orderStatus && !orderMatchesStatus(order, state.orderStatus)) return false;
     return true;
   });
@@ -1274,11 +1354,14 @@ function populateOrderFilters(orders) {
   const sourceSelect = document.getElementById("order-source-filter");
   const current = sourceSelect.value;
   const sources = [...new Set((orders || []).map((order) => order.source).filter(Boolean))].sort();
+  const focusRows = (state.payload?.focusChannels || []).filter((row) => row.focusSummary);
+  const focusSources = focusRows.map((row) => `focus:${row.channel}`);
   sourceSelect.innerHTML = [
     '<option value="">全部来源</option>',
+    ...focusRows.map((row) => `<option value="focus:${escapeHtml(row.channel)}">${escapeHtml(row.label || row.channel)} 合并订单</option>`),
     ...sources.map((source) => `<option value="${escapeHtml(source)}">${escapeHtml(source)}</option>`),
   ].join("");
-  sourceSelect.value = sources.includes(current) ? current : "";
+  sourceSelect.value = [...sources, ...focusSources].includes(current) ? current : "";
   state.orderSource = sourceSelect.value;
 }
 
@@ -1766,9 +1849,10 @@ function formatDateTime(value) {
 }
 
 function statusTone(order) {
-  const status = `${order.fulfillmentStatus || ""} ${order.status || ""}`.toLowerCase();
-  if (status.includes("fulfill") || status.includes("paid")) return "good";
-  if (status.includes("refund") || status.includes("cancel")) return "bad";
+  const states = [order.status, order.fulfillmentStatus].filter(Boolean).map((value) => String(value).toLowerCase().trim());
+  if (states.some((value) => ["refunded", "partially_refunded", "cancelled", "canceled", "voided", "failed"].includes(value))) return "bad";
+  if (states.some((value) => ["unpaid", "unfulfilled", "pending", "open", "authorized", "partially_paid", "partially_fulfilled"].includes(value))) return "warn";
+  if (states.some((value) => ["paid", "fulfilled", "completed"].includes(value))) return "good";
   return "warn";
 }
 
@@ -1976,7 +2060,7 @@ function isLiveRange() {
 
 function metricsPath() {
   const query = currentQueryPayload();
-  const params = new URLSearchParams({ range: query.range });
+  const params = new URLSearchParams({ range: query.range, background: "1" });
   if (query.date) params.set("date", query.date);
   Object.entries(query.filters || {}).forEach(([key, value]) => {
     if (value) params.set(key, value);
@@ -2000,7 +2084,7 @@ function updateControlState() {
   const today = localDateString();
   document.getElementById("today-btn").classList.toggle(
     "active",
-    state.range === "1d" && state.date === today
+    state.range === "1d" && state.followToday && state.date === today
   );
   document.getElementById("date-picker").classList.toggle(
     "active",
@@ -2019,10 +2103,40 @@ function formatRangeCaption(range) {
 }
 
 function localDateString(date = new Date()) {
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: state.storeTimezone, year: "numeric", month: "2-digit", day: "2-digit",
+    }).formatToParts(date);
+    const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+    return `${values.year}-${values.month}-${values.day}`;
+  } catch {
+    // A bad timezone must not prevent the date controls from working.
+  }
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
+}
+
+function refreshTodaySelection(now = new Date()) {
+  const today = localDateString(now);
+  const picker = document.getElementById("date-picker");
+  if (picker) picker.max = today;
+  if (state.range !== "1d" || !state.followToday || state.date === today) return false;
+  state.date = today;
+  if (picker) picker.value = today;
+  return true;
+}
+
+function bindTodayRollover() {
+  const check = () => {
+    if (document.hidden || !refreshTodaySelection()) return;
+    updateControlState();
+    if (state.payload) loadDashboard();
+  };
+  window.setInterval(check, 30000);
+  window.addEventListener("focus", check);
+  document.addEventListener("visibilitychange", check);
 }
 
 function syncToolbarDisclosure() {

@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import mimetypes
+import os
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from shopline_monitor.backend import (
     ShoplineClient,
-    build_dashboard_payload,
     deliver_alert_webhook,
     now_iso,
     probe_integrations,
@@ -19,6 +20,7 @@ from shopline_monitor.server import (
     auth_status,
     dashboard_auth_enabled,
     dashboard_role,
+    dashboard_response,
     normalize_filter_payload,
     parse_date_param,
     verify_dashboard_token,
@@ -144,6 +146,7 @@ def metrics(
     status: str = "",
     market: str = "",
     product: str = "",
+    background: bool = False,
 ) -> Any:
     denied = require_api_access(request)
     if denied:
@@ -151,7 +154,11 @@ def metrics(
     filters = normalize_filter_payload(
         {"channel": channel, "status": status, "market": market, "product": product}
     )
-    return build_dashboard_payload(range, today=parse_date_param(date), filters=filters)
+    # Serverless instances cannot promise background work after returning.
+    return dashboard_response(
+        range, today=parse_date_param(date), filters=filters,
+        background=background and not bool(os.getenv("VERCEL")),
+    )
 
 
 @app.post("/api/sync")
@@ -164,11 +171,13 @@ async def sync(request: Request) -> Any:
     range_key = str(payload.get("range", "7d"))
     selected_date = parse_date_param(str(payload.get("date", "")))
     filters = normalize_filter_payload(payload.get("filters"))
-    return build_dashboard_payload(
+    return await run_in_threadpool(
+        dashboard_response,
         range_key,
         today=selected_date,
         filters=filters,
-        force_refresh=True,
+        force=True,
+        background=bool(payload.get("background")) and not bool(os.getenv("VERCEL")),
     )
 
 
@@ -195,5 +204,5 @@ async def notify_alert(request: Request) -> Any:
         "title": str(raw_alert.get("title") or "SOSOVE 数据预警")[:120],
         "message": str(raw_alert.get("message") or "")[:1200],
     }
-    delivery = deliver_alert_webhook([alert], force_refresh=True, manual=True)
+    delivery = await run_in_threadpool(deliver_alert_webhook, [alert], force_refresh=True, manual=True)
     return {"ok": bool(delivery.get("delivered")), **delivery}

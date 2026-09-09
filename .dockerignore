@@ -1,11 +1,15 @@
-.git
-.gitignore
-.venv
-__pycache__/
-*.pyc
-*.log
-docs/
-shopline_monitor/tests/
-shopline-monitor-*.png
-api/
-vercel.json
+# Build-context allowlist: never send credentials, caches or unrelated files.
+**
+!requirements.txt
+!app.py
+!shopline_monitor/
+!shopline_monitor/requirements.txt
+!shopline_monitor/__init__.py
+!shopline_monitor/backend.py
+!shopline_monitor/env_loader.py
+!shopline_monitor/server.py
+!shopline_monitor/dashboard_runtime.py
+!shopline_monitor/static/
+!shopline_monitor/static/index.html
+!shopline_monitor/static/app.js
+!shopline_monitor/static/styles.css

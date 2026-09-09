@@ -359,11 +359,11 @@
               <div><span>GA4 渠道会话</span><strong id="channel-sessions">--</strong></div>
               <div><span>订单识别率</span><strong id="channel-order-rate">--</strong></div>
               <div><span>SHOPLINE 官方归因</span><strong id="channel-official-rate">--</strong></div>
-              <div class="smartpush-insight">
+              <button type="button" class="smartpush-insight" data-channel-drill="SmartPush" aria-haspopup="dialog" aria-controls="channel-order-dialog" title="查看 SmartPush 订单明细">
                 <span>SmartPush 官方归因</span>
                 <strong id="channel-smartpush-orders">--</strong>
                 <small id="channel-smartpush-revenue">--</small>
-              </div>
+              </button>
             </div>
             <div class="focus-channel-grid" id="focus-channel-grid" aria-label="重点来源订单">
               <button type="button" class="focus-channel-card line" data-channel-drill="LINE">
@@ -374,6 +374,9 @@
               </button>
               <button type="button" class="focus-channel-card organic" data-channel-drill="Organic">
                 <span><i></i>自然流量</span><strong>--</strong><small>--</small><b>查看订单</b>
+              </button>
+              <button type="button" class="focus-channel-card direct" data-channel-drill="Direct">
+                <span><i></i>Direct</span><strong>--</strong><small>直接访问 / 未识别来源</small><b>查看订单</b>
               </button>
             </div>
             <div class="table-wrap">

@@ -3,3 +3,16 @@
 *.log
 .env
 .venv/
+.env.*
+!.env.example
+secrets/
+.cache/
+.run/
+runtime/
+shopline_monitor/runtime_logs/
+.pytest_cache/
+*.pem
+*.key
+*.p12
+*credentials*.json
+ga.json

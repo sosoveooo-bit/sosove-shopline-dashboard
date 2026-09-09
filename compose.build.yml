@@ -1,0 +1,5 @@
+services:
+  dashboard:
+    image: sosove-shopline-dashboard:local
+    build:
+      context: .

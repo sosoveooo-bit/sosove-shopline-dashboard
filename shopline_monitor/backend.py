@@ -152,6 +152,7 @@ _DATA_CACHE: dict[str, tuple[float, Any]] = {}
 _LAST_GOOD_DATA: dict[str, tuple[float, Any]] = {}
 _DATA_CACHE_LOCK = threading.Lock()
 _CLICK_CAMPAIGN_MAP_CACHE: tuple[str, dict[str, dict[str, str]]] = ("", {})
+_UNSET_RATE = object()
 
 
 def load_local_env_files() -> None:
@@ -812,17 +813,39 @@ def build_dashboard_payload(
     previous_end = current_start - timedelta(days=1)
     year_end = today - timedelta(days=365)
     year_start = year_end - timedelta(days=days - 1)
+    ga4_config = Ga4Config.from_env()
+    rate_windows = {
+        "current": (current_start, today),
+        "previous": (previous_start, previous_end),
+        "year": (year_start, year_end),
+        "7d": (today - timedelta(days=6), today),
+        "30d": (today - timedelta(days=29), today),
+    }
+    window_rates: dict[str, float | None] = {}
+    rate_error = None
 
     if isinstance(client, ShoplineClient):
-        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="shopline-load") as pool:
+        # Independent integrations start together; one slow API does not delay
+        # starting the other integration's requests.
+        with ThreadPoolExecutor(max_workers=9, thread_name_prefix="dashboard-load") as pool:
             current_future = pool.submit(client.load_orders, lookback_days, today=today)
             previous_future = pool.submit(client.load_orders, days, today=previous_end)
             year_future = pool.submit(client.load_orders, days, today=year_end)
             products_future = pool.submit(client.load_products, today=today)
+            ga4_lookback_future = pool.submit(load_ga4_traffic_for_window, lookback_start, today)
+            ga4_previous_future = pool.submit(load_ga4_traffic_for_window, previous_start, previous_end)
+            ga4_year_future = pool.submit(load_ga4_traffic_for_window, year_start, year_end)
+            ga4_channels_future = pool.submit(load_ga4_channels_for_window, current_start, today)
+            rates_future = pool.submit(load_ga4_window_rates, rate_windows)
             current_orders_result = current_future.result()
             previous_orders_result = previous_future.result()
             year_orders_result = year_future.result()
             products_result = products_future.result()
+            ga4_lookback = ga4_lookback_future.result()
+            ga4_previous = ga4_previous_future.result()
+            ga4_year = ga4_year_future.result()
+            ga4_channels = ga4_channels_future.result()
+            window_rates, rate_error = rates_future.result()
     else:
         current_orders_result = client.load_orders(lookback_days, today=today)
         previous_orders_result = client.load_orders(days, today=previous_end)
@@ -874,28 +897,32 @@ def build_dashboard_payload(
         traffic_overrides=traffic_overrides,
         sample_mode=year_orders_result.get("source") == "sample",
     )
-    ga4_config = Ga4Config.from_env()
-    if isinstance(client, ShoplineClient):
-        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="ga4-load") as pool:
-            ga4_lookback_future = pool.submit(load_ga4_traffic_for_window, lookback_start, today)
-            ga4_previous_future = pool.submit(load_ga4_traffic_for_window, previous_start, previous_end)
-            ga4_year_future = pool.submit(load_ga4_traffic_for_window, year_start, year_end)
-            ga4_channels_future = pool.submit(load_ga4_channels_for_window, current_start, today)
-            ga4_lookback = ga4_lookback_future.result()
-            ga4_previous = ga4_previous_future.result()
-            ga4_year = ga4_year_future.result()
-            ga4_channels = ga4_channels_future.result()
-    else:
+    if not isinstance(client, ShoplineClient):
         ga4_lookback = load_ga4_traffic_for_window(lookback_start, today)
         ga4_previous = load_ga4_traffic_for_window(previous_start, previous_end)
         ga4_year = load_ga4_traffic_for_window(year_start, year_end)
         ga4_channels = load_ga4_channels_for_window(current_start, today)
+    ga4_alias_orders, _ = deduplicate_orders(
+        current_order_items + list(previous_orders_result["items"])
+    )
+    reconciled_ga4_lookback_rows = reconcile_ga4_transaction_aliases(
+        ga4_lookback.rows,
+        ga4_alias_orders,
+    )
+    reconciled_ga4_previous_rows = reconcile_ga4_transaction_aliases(
+        ga4_previous.rows,
+        list(previous_orders_result["items"]),
+    )
+    reconciled_ga4_year_rows = reconcile_ga4_transaction_aliases(
+        ga4_year.rows,
+        list(year_orders_result["items"]),
+    )
     ga4_current = Ga4TrafficResult(
-        rows=filter_ga4_rows_by_window(ga4_lookback.rows, current_start, today),
+        rows=filter_ga4_rows_by_window(reconciled_ga4_lookback_rows, current_start, today),
         error=ga4_lookback.error,
     )
     lookback_ga4_rows = apply_ga4_conversion_mode(
-        ga4_lookback.rows,
+        reconciled_ga4_lookback_rows,
         lookback_orders,
         ga4_config.conversion_mode,
     )
@@ -905,12 +932,12 @@ def build_dashboard_payload(
         ga4_config.conversion_mode,
     )
     previous_ga4_rows = apply_ga4_conversion_mode(
-        ga4_previous.rows,
+        reconciled_ga4_previous_rows,
         previous_orders,
         ga4_config.conversion_mode,
     )
     year_ga4_rows = apply_ga4_conversion_mode(
-        ga4_year.rows,
+        reconciled_ga4_year_rows,
         year_orders,
         ga4_config.conversion_mode,
     )
@@ -940,6 +967,19 @@ def build_dashboard_payload(
         conversion_traffic_field=client.config.conversion_traffic_field,
         conversion_override=ga4_conversion_rate(year_ga4_rows, ga4_config.conversion_mode),
     )
+    reported_rates = ga4_config.configured and ga4_config.conversion_mode == "key_event_rate"
+    if reported_rates:
+        for name, kpis, rows in (
+            ("current", current_kpis, current_ga4_rows),
+            ("previous", previous_kpis, previous_ga4_rows),
+            ("year", year_kpis, year_ga4_rows),
+        ):
+            start, end = rate_windows[name]
+            # A single daily row is already a whole-period GA4 report. Multiple
+            # daily user rates must never be averaged into a period user rate.
+            kpis["conversion"] = window_rates.get(name) if name in window_rates else (
+                ga4_conversion_rate(rows) if start == end and not rate_error else None
+            )
     series = build_series(current_start, today, current_orders, current_traffic)
     lookback_series = build_series(lookback_start, today, lookback_orders, lookback_traffic)
     ga4_channel_rows = apply_ga4_channel_filter(ga4_channels.rows, normalized_filters)
@@ -950,6 +990,7 @@ def build_dashboard_payload(
             ga4_total_sessions,
         )
     channels = build_channels(current_orders, ga4_channel_rows)
+    focus_channels = build_focus_channels(current_orders, channels, ga4_channel_rows)
     campaigns = build_campaign_breakdown(current_orders)
     attribution_diagnostics = build_attribution_diagnostics(current_orders)
     cost_config = CostConfig.from_env()
@@ -985,6 +1026,7 @@ def build_dashboard_payload(
             ga4_previous.error,
             ga4_year.error,
             ga4_channels.error,
+            rate_error,
         )
         if error
     ]
@@ -993,11 +1035,14 @@ def build_dashboard_payload(
         ga4_config,
         current_ga4_rows,
         ga4_channels.rows,
-        errors=[ga4_current.error, ga4_channels.error],
+        errors=[ga4_current.error, ga4_channels.error, rate_error],
         start=current_start,
         end=today,
         timezone_name=client.config.timezone_name,
     )
+    if reported_rates:
+        ga4_status["conversion"] = current_kpis["conversion"]
+        ga4_status["conversionSource"] = "ga4_period_report"
     reconciliation = build_data_reconciliation(
         current_orders,
         current_ga4_rows,
@@ -1037,6 +1082,7 @@ def build_dashboard_payload(
             "mode": source_mode,
             "label": source_label(source_mode),
             "syncedAt": now_iso(timezone_name=client.config.timezone_name),
+            "timezone": client.config.timezone_name,
             "errors": errors,
             "cached": False,
             "loadMs": round_number((time_module.monotonic() - started_at) * 1000),
@@ -1056,7 +1102,7 @@ def build_dashboard_payload(
                 current_kpis["conversion"],
                 previous_kpis["conversion"],
                 "percent",
-                note=conversion_note(current_kpis["conversion"]),
+                note=(f"GA4 {ga4_config.metric_name}" if reported_rates else conversion_note(current_kpis["conversion"])),
             ),
             "aov": kpi_item("客单价", current_kpis["aov"], previous_kpis["aov"], "currency"),
             "units": kpi_item("售出件数", current_kpis["units"], previous_kpis["units"], "number"),
@@ -1070,8 +1116,10 @@ def build_dashboard_payload(
             lookback_series,
             current_orders,
             current_ga4_rows,
+            window_conversions=window_rates if reported_rates else None,
         ),
         "channels": channels,
+        "focusChannels": focus_channels,
         "channelAnalytics": build_channel_analytics(
             current_orders,
             channels,
@@ -1185,7 +1233,7 @@ def clear_dashboard_cache() -> None:
 
 
 def get_data_cache(key: str) -> Any | None:
-    ttl = dashboard_cache_seconds()
+    ttl = data_cache_seconds(key)
     if ttl <= 0:
         return None
     with _DATA_CACHE_LOCK:
@@ -1197,6 +1245,19 @@ def get_data_cache(key: str) -> Any | None:
             _DATA_CACHE.pop(key, None)
             return None
         return copy.deepcopy(value)
+
+
+def data_cache_seconds(key: str) -> int:
+    ttl = dashboard_cache_seconds()
+    if ttl <= 0:
+        return 0
+    try:
+        end = date.fromisoformat(key.rsplit(":", 1)[-1])
+        if end < current_dashboard_date() - timedelta(days=2):
+            return max(ttl, min(86400, int(os.getenv("DASHBOARD_HISTORY_CACHE_SECONDS", "21600"))))
+    except (ValueError, TypeError):
+        pass
+    return ttl
 
 
 def set_data_cache(key: str, value: Any) -> None:
@@ -1473,6 +1534,12 @@ def normalize_order(
         "id": str(
             extract_raw_order_id(order, index)
         ),
+        "orderNumber": str(
+            pick(order, "name", "order_number", "orderNo", "order_no", default="") or ""
+        ).strip(),
+        "checkoutId": str(
+            pick(order, "checkout_id", "checkoutId", default="") or ""
+        ).strip(),
         "createdAt": order_date.isoformat(),
         "total": round_number(total),
         "currency": str(
@@ -1763,16 +1830,25 @@ def extract_shopline_last_touch_attribution(
 
     url_source = infer_traffic_source_from_url(source_url)
     source = normalize_shopline_attribution_source(source_name) if source_name else ""
+    tracking_source = normalize_marketing_source(
+        f"{tracking.get('utm_source', '')} {tracking.get('utm_medium', '')}".strip()
+    )
+    # SmartPush now reports some official orders as Email while placing its
+    # product identifier in utm_medium (for example email / smartpush).
+    if tracking_source == "SmartPush":
+        source = "SmartPush"
     # Referrer domains are stronger evidence when SHOPLINE's source label and
     # URL disagree (for example Google + search.yahoo.co.jp).
-    if url_source in TRAFFIC_SOURCE_BUCKETS and url_source not in {"Direct", "Other"}:
+    if (
+        source != "SmartPush"
+        and url_source in TRAFFIC_SOURCE_BUCKETS
+        and url_source not in {"Direct", "Other"}
+    ):
         source = url_source
     if source not in TRAFFIC_SOURCE_BUCKETS:
         source = infer_traffic_source_from_url(landing_page)
     if source not in TRAFFIC_SOURCE_BUCKETS:
-        source = normalize_marketing_source(
-            f"{tracking.get('utm_source', '')} {tracking.get('utm_medium', '')}".strip()
-        )
+        source = tracking_source
     if source not in TRAFFIC_SOURCE_BUCKETS:
         source = {
             "direct": "Direct",
@@ -2445,6 +2521,78 @@ def normalize_ga4_conversion_mode(value: Any) -> str:
     return DEFAULT_GA4_CONVERSION_MODE
 
 
+def fetch_ga4_window_rates(
+    config: Ga4Config,
+    windows: list[tuple[date, date]],
+) -> list[float | None]:
+    from google.analytics.data_v1beta import BetaAnalyticsDataClient
+    from google.analytics.data_v1beta.types import BatchRunReportsRequest, RunReportRequest, DateRange, Metric
+    from google.oauth2 import service_account
+
+    credentials = None
+    if config.service_account_json:
+        credentials = service_account.Credentials.from_service_account_info(
+            json.loads(config.service_account_json), scopes=[GA4_READONLY_SCOPE]
+        )
+    elif config.service_account_file:
+        credentials = service_account.Credentials.from_service_account_file(
+            config.service_account_file, scopes=[GA4_READONLY_SCOPE]
+        )
+    client = BetaAnalyticsDataClient(credentials=credentials)
+    rates = []
+    try:
+        # GA4 supports five independent reports per batch. Omit date dimensions
+        # so GA4 computes the configured metric over each complete date range.
+        for offset in range(0, len(windows), 5):
+            batch = windows[offset:offset + 5]
+            request = BatchRunReportsRequest(
+                property=ga4_property_name(config.property_id),
+                requests=[RunReportRequest(
+                    date_ranges=[DateRange(start_date=start.isoformat(), end_date=end.isoformat())],
+                    metrics=[Metric(name=config.metric_name)],
+                    keep_empty_rows=True,
+                ) for start, end in batch],
+            )
+            response = client.batch_run_reports(request=request, timeout=config.timeout_seconds)
+            if len(response.reports) != len(batch):
+                raise ValueError("GA4 period report count does not match request")
+            for report in response.reports:
+                rates.append(normalize_ga4_rate(report.rows[0].metric_values[0].value) if report.rows else None)
+    finally:
+        client.transport.close()
+    return rates
+
+
+def load_ga4_window_rates(
+    windows: dict[str, tuple[date, date]],
+) -> tuple[dict[str, float | None], str | None]:
+    config = Ga4Config.from_env()
+    if not config.configured or config.conversion_mode != "key_event_rate":
+        return {}, None
+    keys = {
+        name: f"ga4:rate:{config.property_id}:{config.metric_name}:{start.isoformat()}:{end.isoformat()}"
+        for name, (start, end) in windows.items()
+    }
+    values = {}
+    missing = {}
+    for name, key in keys.items():
+        cached = get_data_cache(key)
+        if cached is not None:
+            values[key] = cached["rate"]
+        else:
+            missing[key] = windows[name]
+    error = None
+    if missing:
+        try:
+            rates = fetch_ga4_window_rates(config, list(missing.values()))
+            for key, rate in zip(missing, rates):
+                values[key] = rate
+                set_data_cache(key, {"rate": rate})
+        except Exception as exc:
+            error = f"GA4 Conversion: {exc.__class__.__name__}: {exc}"
+    return {name: values.get(key) for name, key in keys.items()}, error
+
+
 def load_ga4_traffic_for_window(start: date, end: date) -> Ga4TrafficResult:
     config = Ga4Config.from_env()
     if not config.configured:
@@ -2965,6 +3113,7 @@ def normalize_ga4_transaction_rows(response: Any) -> list[dict[str, Any]]:
                 "duplicatePurchaseEvents": 0,
                 "duplicateTransactionIds": 0,
                 "missingTransactionIdEvents": 0,
+                "transactionRecords": [],
             },
         )
         bucket["rawPurchaseEvents"] += event_count
@@ -2973,6 +3122,9 @@ def normalize_ga4_transaction_rows(response: Any) -> list[dict[str, Any]]:
             bucket["duplicatePurchaseEvents"] += event_count
             continue
         bucket["transactions"] += 1
+        bucket["transactionRecords"].append(
+            {"id": transaction_id, "eventCount": event_count}
+        )
         if event_count > 1:
             bucket["duplicateTransactionIds"] += 1
             bucket["duplicatePurchaseEvents"] += event_count - 1
@@ -3001,10 +3153,85 @@ def merge_ga4_transaction_diagnostics(
                 "missingTransactionIdEvents": parse_int(
                     diagnostics.get("missingTransactionIdEvents")
                 ),
+                "transactionRecords": list(
+                    diagnostics.get("transactionRecords") or []
+                ),
                 "purchaseMetric": "unique_transaction_id",
             }
         )
     return merged
+
+
+def reconcile_ga4_transaction_aliases(
+    rows: list[dict[str, Any]],
+    orders: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Collapse GA4 transaction IDs that are aliases of the same Shopline order."""
+    alias_to_order: dict[str, str] = {}
+    ambiguous_aliases: set[str] = set()
+    for index, order in enumerate(orders):
+        canonical = str(
+            order.get("id")
+            or order.get("orderNumber")
+            or order.get("checkoutId")
+            or f"shopline-order-{index}"
+        ).strip()
+        aliases = {
+            str(order.get(field) or "").strip()
+            for field in ("id", "orderNumber", "checkoutId")
+        }
+        for alias in aliases - {""}:
+            existing = alias_to_order.get(alias)
+            if existing and existing != canonical:
+                ambiguous_aliases.add(alias)
+                alias_to_order.pop(alias, None)
+            elif alias not in ambiguous_aliases:
+                alias_to_order[alias] = canonical
+
+    reconciled = []
+    for row in rows:
+        next_row = dict(row)
+        records = row.get("transactionRecords")
+        if not isinstance(records, list):
+            reconciled.append(next_row)
+            continue
+
+        transaction_ids = {
+            str(record.get("id") or "").strip()
+            for record in records
+            if isinstance(record, dict) and str(record.get("id") or "").strip()
+        }
+        matched_orders = {
+            alias_to_order[transaction_id]
+            for transaction_id in transaction_ids
+            if transaction_id in alias_to_order
+        }
+        unmatched_ids = {
+            transaction_id
+            for transaction_id in transaction_ids
+            if transaction_id not in alias_to_order
+        }
+        unique_transactions = len(matched_orders) + len(unmatched_ids)
+        raw_transaction_ids = len(transaction_ids)
+        alias_duplicates = max(0, raw_transaction_ids - unique_transactions)
+
+        next_row.update(
+            {
+                "transactions": unique_transactions,
+                "rawTransactionIds": raw_transaction_ids,
+                "aliasDuplicateTransactionIds": alias_duplicates,
+                "matchedShoplineTransactions": len(matched_orders),
+                "unmatchedTransactionIds": len(unmatched_ids),
+                "purchaseMetric": (
+                    "shopline_alias_unique_transaction_id"
+                    if alias_duplicates
+                    else "unique_transaction_id"
+                ),
+            }
+        )
+        next_row.pop("transactionRecords", None)
+        reconciled.append(next_row)
+    return reconciled
 
 
 def ga4_purchase_count(rows: Iterable[dict[str, Any]]) -> float | None:
@@ -3130,6 +3357,10 @@ def merge_traffic_series(
                 "duplicatePurchaseEvents",
                 "duplicateTransactionIds",
                 "missingTransactionIdEvents",
+                "rawTransactionIds",
+                "aliasDuplicateTransactionIds",
+                "matchedShoplineTransactions",
+                "unmatchedTransactionIds",
                 "purchaseMetric",
                 "shoplineOrders",
                 "conversion",
@@ -3470,6 +3701,7 @@ def build_chart_analytics(
     lookback_series: list[dict[str, Any]],
     current_orders: list[dict[str, Any]],
     current_ga4_rows: list[dict[str, Any]],
+    window_conversions: dict[str, float | None] | None = None,
 ) -> dict[str, Any]:
     return {
         "comparison": [
@@ -3485,8 +3717,12 @@ def build_chart_analytics(
             ),
         ],
         "windows": [
-            summarize_series_window("近 7 天", lookback_series[-7:]),
-            summarize_series_window("近 30 天", lookback_series[-30:]),
+            summarize_series_window("近 7 天", lookback_series[-7:], conversion_override=(
+                window_conversions.get("7d") if window_conversions is not None else _UNSET_RATE
+            )),
+            summarize_series_window("近 30 天", lookback_series[-30:], conversion_override=(
+                window_conversions.get("30d") if window_conversions is not None else _UNSET_RATE
+            )),
         ],
         "funnel": build_conversion_funnel(current_orders, current_ga4_rows),
     }
@@ -3512,21 +3748,13 @@ def comparison_item(
     }
 
 
-def summarize_series_window(label: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
+def summarize_series_window(
+    label: str, rows: list[dict[str, Any]], conversion_override: Any = _UNSET_RATE,
+) -> dict[str, Any]:
     revenue = sum(float(row.get("revenue") or 0) for row in rows)
     orders = sum(int(row.get("orders") or 0) for row in rows)
     sessions = sum_optional_int(row.get("sessions") for row in rows)
-    key_events = ga4_purchase_count(rows)
-    conversion_values = [
-        float(row.get("conversion"))
-        for row in rows
-        if row.get("conversion") is not None
-    ]
-    conversion = None
-    if sessions is not None and sessions > 0 and key_events is not None:
-        conversion = key_events / sessions * 100
-    elif conversion_values:
-        conversion = sum(conversion_values) / len(conversion_values)
+    conversion = ga4_conversion_rate(rows) if conversion_override is _UNSET_RATE else conversion_override
 
     return {
         "label": label,
@@ -3758,6 +3986,84 @@ def build_channels(
         )
     sort_field = "sessions" if total_sessions else "revenue"
     return sorted(channels, key=lambda row: (row[sort_field], row["revenue"]), reverse=True)
+
+
+def build_focus_channels(
+    orders: list[dict[str, Any]],
+    channels: list[dict[str, Any]],
+    ga4_rows: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Build quick-audit channel rows without changing the main channel totals."""
+    lookup = {str(row.get("channel") or ""): copy.deepcopy(row) for row in channels}
+    focus_rows = [lookup[channel] for channel in ("LINE", "Organic") if channel in lookup]
+
+    yahoo_orders = [order for order in orders if str(order.get("source") or "") == "Yahoo"]
+    google_orders = [order for order in orders if is_google_organic_order(order)]
+    merged_orders = []
+    for order in yahoo_orders + google_orders:
+        merged_order = copy.deepcopy(order)
+        merged_order["source"] = "Yahoo"
+        merged_orders.append(merged_order)
+
+    yahoo_ga4_rows = [
+        row
+        for row in (ga4_rows or [])
+        if str(row.get("channel") or "") == "Yahoo"
+        or is_google_organic_ga4_row(row)
+    ]
+    merged_ga4_rows = []
+    for row in yahoo_ga4_rows:
+        merged_row = copy.deepcopy(row)
+        merged_row["channel"] = "Yahoo"
+        merged_ga4_rows.append(merged_row)
+
+    merged_rows = build_channels(merged_orders, merged_ga4_rows)
+    yahoo_row = next(
+        (row for row in merged_rows if row.get("channel") == "Yahoo"),
+        None,
+    )
+    if yahoo_row:
+        yahoo_row["label"] = "Yahoo"
+        yahoo_row["focusSummary"] = (
+            f"Yahoo {len(yahoo_orders)} 单 · Google自然 {len(google_orders)} 单"
+        )
+        yahoo_row["conversionNote"] = (
+            "Yahoo 订单 + Google 来源中未捕获 UTM、Campaign 或广告 Click ID 的自然订单"
+        )
+        focus_rows.append(yahoo_row)
+    return focus_rows
+
+
+def is_google_organic_order(order: dict[str, Any]) -> bool:
+    """Treat unattributed Google orders as organic only when no paid evidence exists."""
+    if str(order.get("source") or "").strip() != "Google":
+        return False
+    tracking_fields = (
+        "sourceUtm",
+        "sourceMedium",
+        "sourceCampaign",
+        "sourceCampaignId",
+        "sourceAdset",
+        "sourceAd",
+        "sourceContent",
+        "sourceTerm",
+    )
+    if any(str(order.get(field) or "").strip() for field in tracking_fields):
+        return False
+    click_ids = order.get("clickIds")
+    return not (
+        isinstance(click_ids, dict)
+        and any(str(value or "").strip() for value in click_ids.values())
+    )
+
+
+def is_google_organic_ga4_row(row: dict[str, Any]) -> bool:
+    source = str(row.get("source") or "").strip().lower()
+    medium = str(row.get("medium") or "").strip().lower()
+    group = str(row.get("group") or "").strip().lower()
+    return source in {"google", "www.google.com"} and (
+        "organic" in medium or "organic" in group
+    )
 
 
 def empty_channel_bucket(source: str) -> dict[str, Any]:
@@ -4217,6 +4523,18 @@ def build_ga4_status(
     missing_transaction_id_events = sum(
         parse_int(row.get("missingTransactionIdEvents")) for row in traffic_rows
     )
+    raw_transaction_ids = sum_optional_int(
+        row.get("rawTransactionIds") for row in traffic_rows
+    )
+    alias_duplicate_transaction_ids = sum(
+        parse_int(row.get("aliasDuplicateTransactionIds")) for row in traffic_rows
+    )
+    matched_shopline_transactions = sum_optional_int(
+        row.get("matchedShoplineTransactions") for row in traffic_rows
+    )
+    unmatched_transaction_ids = sum_optional_int(
+        row.get("unmatchedTransactionIds") for row in traffic_rows
+    )
     conversion = ga4_conversion_rate(traffic_rows, config.conversion_mode)
     session_purchase_rate = (
         round_number(float(purchases) / sessions * 100)
@@ -4254,8 +4572,14 @@ def build_ga4_status(
         "duplicatePurchaseEvents": duplicate_purchase_events,
         "duplicateTransactionIds": duplicate_transaction_ids,
         "missingTransactionIdEvents": missing_transaction_id_events,
+        "rawTransactionIds": raw_transaction_ids,
+        "aliasDuplicateTransactionIds": alias_duplicate_transaction_ids,
+        "matchedShoplineTransactions": matched_shopline_transactions,
+        "unmatchedTransactionIds": unmatched_transaction_ids,
         "purchaseMetric": (
-            "unique_transaction_id"
+            "shopline_alias_unique_transaction_id"
+            if alias_duplicate_transaction_ids
+            else "unique_transaction_id"
             if any("transactions" in row for row in traffic_rows)
             else "key_events"
         ),
@@ -4288,6 +4612,10 @@ def build_data_reconciliation(
             "rawPurchaseEvents": (ga4_status or {}).get("rawPurchaseEvents"),
             "duplicatePurchaseEvents": (ga4_status or {}).get("duplicatePurchaseEvents"),
             "duplicateTransactionIds": (ga4_status or {}).get("duplicateTransactionIds"),
+            "rawTransactionIds": (ga4_status or {}).get("rawTransactionIds"),
+            "aliasDuplicateTransactionIds": (ga4_status or {}).get("aliasDuplicateTransactionIds"),
+            "matchedShoplineTransactions": (ga4_status or {}).get("matchedShoplineTransactions"),
+            "unmatchedTransactionIds": (ga4_status or {}).get("unmatchedTransactionIds"),
         }
     difference = shopline_orders - ga4_purchases
     difference_rate = (
@@ -4314,6 +4642,10 @@ def build_data_reconciliation(
         "rawPurchaseEvents": (ga4_status or {}).get("rawPurchaseEvents"),
         "duplicatePurchaseEvents": (ga4_status or {}).get("duplicatePurchaseEvents"),
         "duplicateTransactionIds": (ga4_status or {}).get("duplicateTransactionIds"),
+        "rawTransactionIds": (ga4_status or {}).get("rawTransactionIds"),
+        "aliasDuplicateTransactionIds": (ga4_status or {}).get("aliasDuplicateTransactionIds"),
+        "matchedShoplineTransactions": (ga4_status or {}).get("matchedShoplineTransactions"),
+        "unmatchedTransactionIds": (ga4_status or {}).get("unmatchedTransactionIds"),
     }
 
 

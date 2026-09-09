@@ -5,6 +5,7 @@ import json
 import mimetypes
 import os
 import secrets
+import threading
 from datetime import date
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -16,12 +17,31 @@ from shopline_monitor.backend import (
     build_dashboard_payload,
     deliver_alert_webhook,
     now_iso,
+    current_dashboard_date,
+    dashboard_cache_seconds,
+    normalize_dashboard_filters,
     probe_integrations,
 )
+from shopline_monitor.dashboard_runtime import DashboardRuntime, configuration_fingerprint
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
 STATIC_DIR = PROJECT_DIR / "static"
+_runtime: DashboardRuntime | None = None
+_runtime_lock = threading.Lock()
+
+
+def dashboard_response(range_key: str, today: date | None, filters: dict[str, str],
+                       force: bool = False, background: bool = False) -> dict:
+    if not background:
+        return build_dashboard_payload(range_key, today=today, filters=filters, force_refresh=force)
+    global _runtime
+    with _runtime_lock:
+        if _runtime is None:
+            directory = Path(os.getenv("DASHBOARD_SNAPSHOT_DIR") or PROJECT_DIR.parent / ".cache" / "shopline-monitor")
+            _runtime = DashboardRuntime(build_dashboard_payload, directory, configuration_fingerprint(), ttl=dashboard_cache_seconds())
+    range_key = range_key if range_key in {"1d", "7d", "30d", "90d"} else "7d"
+    return _runtime.request(range_key, today or current_dashboard_date(), normalize_dashboard_filters(filters), force=force)
 
 
 class ShoplineMonitorHandler(BaseHTTPRequestHandler):
@@ -57,7 +77,8 @@ class ShoplineMonitorHandler(BaseHTTPRequestHandler):
             range_key = query.get("range", ["7d"])[0]
             selected_date = parse_date_param(query.get("date", [""])[0])
             filters = extract_dashboard_filters(query)
-            self.send_json(build_dashboard_payload(range_key, today=selected_date, filters=filters))
+            self.send_json(dashboard_response(range_key, selected_date, filters,
+                                             background=query.get("background", [""])[0] == "1"))
             return
         self.send_error_json(HTTPStatus.NOT_FOUND, "route not found")
 
@@ -79,11 +100,12 @@ class ShoplineMonitorHandler(BaseHTTPRequestHandler):
             selected_date = parse_date_param(str(payload.get("date", ""))) if isinstance(payload, dict) else None
             filters = normalize_filter_payload(payload.get("filters") if isinstance(payload, dict) else {})
             self.send_json(
-                build_dashboard_payload(
+                dashboard_response(
                     range_key,
                     today=selected_date,
                     filters=filters,
-                    force_refresh=True,
+                    force=True,
+                    background=bool(payload.get("background")) if isinstance(payload, dict) else False,
                 )
             )
             return
@@ -207,6 +229,7 @@ def auth_status() -> dict[str, object]:
     return {
         "configured": dashboard_auth_enabled(),
         "role": dashboard_role(),
+        "timezone": ShoplineClient().config.timezone_name,
     }
 
 

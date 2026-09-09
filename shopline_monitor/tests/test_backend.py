@@ -23,6 +23,7 @@ from shopline_monitor.backend import (
     build_campaign_breakdown,
     build_channel_analytics,
     build_channels,
+    build_focus_channels,
     build_alerts_v2,
     build_ad_performance,
     build_attribution_diagnostics,
@@ -47,10 +48,12 @@ from shopline_monitor.backend import (
     normalize_marketing_source,
     probe_ga4_connection,
     reconcile_ga4_channel_sessions,
+    reconcile_ga4_transaction_aliases,
     apply_dashboard_filters,
     deduplicate_orders,
     clear_data_cache,
     clear_live_data_cache,
+    summarize_series_window,
 )
 from shopline_monitor.server import dashboard_auth_enabled, parse_date_param, verify_dashboard_token
 
@@ -80,6 +83,8 @@ class BackendTests(unittest.TestCase):
                 "orders": [
                     {
                         "order_id": "1001",
+                        "name": "JCJP1001",
+                        "checkout_id": "checkout-1001",
                         "created_at": "2026-06-17T08:30:00Z",
                         "total_price": "129.50",
                         "currency": "USD",
@@ -97,6 +102,8 @@ class BackendTests(unittest.TestCase):
 
         self.assertEqual(len(orders), 1)
         self.assertEqual(orders[0]["id"], "1001")
+        self.assertEqual(orders[0]["orderNumber"], "JCJP1001")
+        self.assertEqual(orders[0]["checkoutId"], "checkout-1001")
         self.assertEqual(orders[0]["customer"], "Mia Chen")
         self.assertEqual(orders[0]["source"], "TikTok")
         self.assertEqual(orders[0]["sourceRaw"], "TikTok")
@@ -258,6 +265,51 @@ class BackendTests(unittest.TestCase):
 
         self.assertEqual(orders[0]["source"], "Yahoo")
         self.assertEqual(orders[0]["sourceRaw"], "https://search.yahoo.co.jp/")
+
+    def test_shopline_official_attribution_recognizes_smartpush_in_utm_medium(self):
+        orders = normalize_shopline_orders(
+            {
+                "orders": [
+                    {"order_id": "smartpush-medium", "total_price": "11477"},
+                    {"order_id": "regular-email", "total_price": "6980"},
+                ]
+            },
+            default_currency="JPY",
+            attribution_by_order_id={
+                "smartpush-medium": {
+                    "order_seq": "smartpush-medium",
+                    "last_interaction": {
+                        "last_interaction_source": "Other",
+                        "last_referrer_name": "Email",
+                        "last_referrer_url": None,
+                        "last_utm_parameters": {
+                            "last_utm_source": "email",
+                            "last_utm_medium": "smartpush",
+                            "last_utm_campaign": "636727",
+                        },
+                    },
+                },
+                "regular-email": {
+                    "order_seq": "regular-email",
+                    "last_interaction": {
+                        "last_interaction_source": "Other",
+                        "last_referrer_name": "Email",
+                        "last_referrer_url": None,
+                        "last_utm_parameters": {
+                            "last_utm_source": "newsletter",
+                            "last_utm_medium": "email",
+                            "last_utm_campaign": "weekly-news",
+                        },
+                    },
+                },
+            },
+        )
+
+        self.assertEqual([order["source"] for order in orders], ["SmartPush", "Email"])
+        self.assertEqual(orders[0]["sourceUtm"], "email")
+        self.assertEqual(orders[0]["sourceMedium"], "smartpush")
+        self.assertEqual(orders[0]["sourceCampaign"], "636727")
+        self.assertEqual(orders[0]["attributionMethod"], "shopline_attribution")
 
     def test_ga4_channels_merge_sessions_with_shopline_orders(self):
         response = SimpleNamespace(
@@ -422,6 +474,38 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(ga4_purchase_count(rows), 2)
         reconciliation = build_data_reconciliation([{"id": "1"}, {"id": "2"}], rows)
         self.assertEqual(reconciliation["status"], "aligned")
+
+    def test_ga4_transaction_aliases_collapse_shopline_id_and_order_number(self):
+        rows = [
+            {
+                "date": "2026-06-17",
+                "transactions": 5,
+                "transactionRecords": [
+                    {"id": "internal-1", "eventCount": 2},
+                    {"id": "JCJP1001", "eventCount": 2},
+                    {"id": "internal-2", "eventCount": 1},
+                    {"id": "JCJP1002", "eventCount": 1},
+                    {"id": "external-3", "eventCount": 1},
+                ],
+            }
+        ]
+        orders = [
+            {"id": "internal-1", "orderNumber": "JCJP1001"},
+            {"id": "internal-2", "orderNumber": "JCJP1002"},
+        ]
+
+        reconciled = reconcile_ga4_transaction_aliases(rows, orders)
+
+        self.assertEqual(reconciled[0]["transactions"], 3)
+        self.assertEqual(reconciled[0]["rawTransactionIds"], 5)
+        self.assertEqual(reconciled[0]["aliasDuplicateTransactionIds"], 2)
+        self.assertEqual(reconciled[0]["matchedShoplineTransactions"], 2)
+        self.assertEqual(reconciled[0]["unmatchedTransactionIds"], 1)
+        self.assertEqual(
+            reconciled[0]["purchaseMetric"],
+            "shopline_alias_unique_transaction_id",
+        )
+        self.assertNotIn("transactionRecords", reconciled[0])
 
     def test_ga4_channel_session_gap_is_reconciled_to_total_sessions(self):
         rows = reconcile_ga4_channel_sessions(
@@ -1088,6 +1172,99 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(instagram["orders"], 24)
         self.assertEqual(instagram["orderDetailCount"], 24)
         self.assertEqual(len(instagram["orderDetails"]), 24)
+
+    def test_focus_channels_merges_untracked_google_orders_into_yahoo(self):
+        orders = [
+            {
+                "id": "yahoo-order",
+                "createdAt": "2026-08-13",
+                "source": "Yahoo",
+                "total": 3000,
+                "units": 1,
+                "status": "paid",
+                "attributionMethod": "shopline_attribution",
+                "attributionConfidence": "high",
+            },
+            {
+                "id": "google-organic",
+                "createdAt": "2026-08-13",
+                "source": "Google",
+                "total": 9800,
+                "units": 1,
+                "status": "paid",
+                "sourceUtm": "",
+                "sourceMedium": "",
+                "sourceCampaign": "",
+                "clickIds": {},
+                "attributionMethod": "shopline_attribution",
+                "attributionConfidence": "high",
+            },
+            {
+                "id": "google-ads-click",
+                "createdAt": "2026-08-13",
+                "source": "Google",
+                "total": 7600,
+                "units": 1,
+                "sourceUtm": "",
+                "sourceMedium": "",
+                "sourceCampaign": "",
+                "clickIds": {"gclid": "paid-click"},
+            },
+            {
+                "id": "google-utm",
+                "createdAt": "2026-08-13",
+                "source": "Google",
+                "total": 6400,
+                "units": 1,
+                "sourceUtm": "google",
+                "sourceMedium": "organic",
+                "sourceCampaign": "seo",
+                "clickIds": {},
+            },
+        ]
+        ga4_rows = [
+            {
+                "channel": "Yahoo",
+                "source": "yahoo",
+                "medium": "organic",
+                "group": "Organic Search",
+                "sessions": 10,
+                "activeUsers": 8,
+                "keyEvents": 1,
+            },
+            {
+                "channel": "Google",
+                "source": "google",
+                "medium": "organic",
+                "group": "Organic Search",
+                "sessions": 42,
+                "activeUsers": 35,
+                "keyEvents": 3,
+            },
+            {
+                "channel": "Google",
+                "source": "google",
+                "medium": "cpc",
+                "group": "Paid Search",
+                "sessions": 200,
+                "activeUsers": 160,
+                "keyEvents": 8,
+            },
+        ]
+
+        focus_rows = build_focus_channels(orders, build_channels(orders, ga4_rows), ga4_rows)
+        yahoo = next(row for row in focus_rows if row["channel"] == "Yahoo")
+
+        self.assertFalse(any(row["channel"] == "Google Organic" for row in focus_rows))
+        self.assertEqual(yahoo["orders"], 2)
+        self.assertEqual(yahoo["officialOrders"], 2)
+        self.assertEqual(yahoo["revenue"], 12800)
+        self.assertEqual(yahoo["sessions"], 52)
+        self.assertEqual(
+            {row["id"] for row in yahoo["orderDetails"]},
+            {"yahoo-order", "google-organic"},
+        )
+        self.assertEqual(yahoo["focusSummary"], "Yahoo 1 单 · Google自然 1 单")
 
     def test_load_orders_follows_shopline_next_page_link(self):
         class PagingClient(ShoplineClient):
@@ -1788,6 +1965,31 @@ class BackendTests(unittest.TestCase):
         self.assertIn('data-channel-drill="LINE"', index_html)
         self.assertIn('data-channel-drill="Yahoo"', index_html)
         self.assertIn('data-channel-drill="Organic"', index_html)
+        self.assertNotIn('data-channel-drill="Google Organic"', index_html)
+        self.assertIn('data-channel-drill="Direct"', index_html)
+
+    def test_smartpush_summary_is_an_accessible_order_dialog_button(self):
+        from html.parser import HTMLParser
+
+        class InsightParser(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.insights = []
+
+            def handle_starttag(self, tag, attrs):
+                values = dict(attrs)
+                if "smartpush-insight" in values.get("class", "").split():
+                    self.insights.append((tag, values))
+
+        parser = InsightParser()
+        parser.feed((Path(__file__).resolve().parents[1] / "static" / "index.html").read_text(encoding="utf-8"))
+        self.assertEqual(len(parser.insights), 1)
+        tag, attrs = parser.insights[0]
+        self.assertEqual(tag, "button")
+        self.assertEqual(attrs["type"], "button")
+        self.assertEqual(attrs["data-channel-drill"], "SmartPush")
+        self.assertEqual(attrs["aria-haspopup"], "dialog")
+        self.assertEqual(attrs["aria-controls"], "channel-order-dialog")
 
     def test_optional_dashboard_authentication(self):
         with patch.dict(os.environ, {"DASHBOARD_ACCESS_TOKEN": "secret-token"}):
@@ -1802,6 +2004,32 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(parse_date_param("2026-06-17"), date(2026, 6, 17))
         self.assertEqual(parse_date_param("2026-06-17T08:30:00+08:00"), date(2026, 6, 17))
         self.assertIsNone(parse_date_param("not-a-date"))
+
+    def test_window_conversion_never_substitutes_transactions_over_sessions(self):
+        rows = [{"sessions": 100, "transactions": 50, "conversion": 1.29}]
+        self.assertEqual(summarize_series_window("7d", rows)["conversion"], 1.29)
+        self.assertEqual(summarize_series_window("7d", rows, conversion_override=1.59)["conversion"], 1.59)
+
+    def test_window_missing_reported_conversion_stays_empty(self):
+        rows = [{"sessions": 100, "transactions": 50, "conversion": 1.29}]
+        self.assertIsNone(summarize_series_window("7d", rows, conversion_override=None)["conversion"])
+
+    def test_ga4_window_rates_fetch_complete_reports_without_date_dimensions(self):
+        from shopline_monitor.backend import fetch_ga4_window_rates
+        config = Ga4Config(property_id="123", service_account_json="{}")
+        reports = SimpleNamespace(reports=[SimpleNamespace(rows=[SimpleNamespace(
+            metric_values=[SimpleNamespace(value="0.0159")]
+        )])])
+        with patch("google.oauth2.service_account.Credentials.from_service_account_info"), patch(
+            "google.analytics.data_v1beta.BetaAnalyticsDataClient"
+        ) as client_type:
+            client_type.return_value.batch_run_reports.return_value = reports
+            rates = fetch_ga4_window_rates(config, [(date(2026, 9, 1), date(2026, 9, 7))])
+            request = client_type.return_value.batch_run_reports.call_args.kwargs["request"]
+        self.assertEqual(rates, [1.59])
+        self.assertFalse(request.requests[0].dimensions)
+        self.assertEqual(request.requests[0].metrics[0].name, "userKeyEventRate:purchase")
+        self.assertEqual(request.requests[0].date_ranges[0].start_date, "2026-09-01")
 
 
 if __name__ == "__main__":

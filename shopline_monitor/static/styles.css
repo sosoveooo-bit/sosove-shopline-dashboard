@@ -1961,7 +1961,8 @@ button {
   margin: -2px 0 12px;
 }
 
-.channel-insights > div {
+.channel-insights > div,
+.channel-insights > .smartpush-insight {
   position: relative;
   display: grid;
   gap: 4px;
@@ -1973,7 +1974,8 @@ button {
   border-radius: 9px;
 }
 
-.channel-insights > div::after {
+.channel-insights > div::after,
+.channel-insights > .smartpush-insight::after {
   position: absolute;
   inset: auto 0 0;
   height: 2px;
@@ -2006,8 +2008,27 @@ button {
 }
 
 .channel-insights .smartpush-insight {
+  width: 100%;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
   background: linear-gradient(135deg, rgba(173, 112, 255, 0.14), rgba(99, 216, 255, 0.04));
   border-color: rgba(173, 112, 255, 0.22);
+}
+
+.channel-insights .smartpush-insight:hover,
+.channel-insights .smartpush-insight:focus-visible {
+  border-color: var(--cyan);
+}
+
+.channel-insights .smartpush-insight:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 2px;
+}
+
+.channel-insights .smartpush-insight:hover > span {
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 
 .channel-insights .smartpush-insight::after {
@@ -2016,7 +2037,7 @@ button {
 
 .focus-channel-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px;
   margin: 0 0 12px;
 }
@@ -2066,6 +2087,12 @@ button {
 .focus-channel-card.yahoo::after { background: linear-gradient(90deg, var(--amber), transparent); }
 .focus-channel-card.organic span i { background: var(--green); box-shadow: 0 0 10px var(--green); }
 .focus-channel-card.organic::after { background: linear-gradient(90deg, var(--green), transparent); }
+.focus-channel-card.direct {
+  background: linear-gradient(135deg, rgba(148, 163, 184, 0.12), rgba(99, 216, 255, 0.035));
+  border-color: rgba(148, 163, 184, 0.24);
+}
+.focus-channel-card.direct span i { background: #94a3b8; box-shadow: 0 0 10px rgba(148, 163, 184, 0.9); }
+.focus-channel-card.direct::after { background: linear-gradient(90deg, #94a3b8, var(--cyan), transparent); }
 .focus-channel-card:not(.has-orders) { opacity: 0.72; }
 
 .channel-table {
@@ -3437,6 +3464,8 @@ tbody tr:hover {
   .trust-grid { grid-template-columns: 1fr 1fr; }
 
   .trust-panel:last-child { grid-column: 1 / -1; }
+
+  .focus-channel-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 @media (max-width: 920px) {
@@ -3693,7 +3722,8 @@ tbody tr:hover {
     gap: 6px;
   }
 
-  .channel-insights > div {
+  .channel-insights > div,
+  .channel-insights > .smartpush-insight {
     padding: 8px;
   }
 

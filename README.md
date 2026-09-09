@@ -2,6 +2,14 @@
 
 A small full-stack dashboard for monitoring Shopline store data.
 
+## Docker 部署入口
+
+完整中文教程：[Ubuntu VPS Docker 部署](docs/docker-deploy.md)
+
+最新版本包含 SmartPush 点击查看订单、Yahoo 合并订单分页、GA4 同口径周期转化率，以及后台快照更新。容器与本地面板使用同一套后端逻辑。
+
+Docker 镜像不包含密钥。使用服务器上的 `.env` 配置 Shopline，并把 GA4 私钥挂载为 `/app/secrets/ga.json`。默认端口为 `127.0.0.1:8000`，避免直接暴露订单数据；公网访问及现有 Nginx 的切换步骤见教程。
+
 ## Run locally
 
 ```powershell
@@ -194,63 +202,34 @@ Vercel uses `api/index.py` as the Python Function entrypoint and rewrites all ro
 
 ## Deploy with Docker
 
-This repo includes a `Dockerfile`, `docker-compose.yml`, and a GitHub Actions workflow that publishes an image to GitHub Container Registry:
+Follow the [complete Chinese Docker guide](docs/docker-deploy.md). GitHub Actions tests the code, starts a synthetic-data container, and publishes only after the smoke checks pass:
 
 ```text
 ghcr.io/sosoveooo-bit/sosove-shopline-dashboard:latest
 ```
 
-After GitHub Actions finishes, deploy on a VPS:
+For a new deployment directory, download the Compose file and configuration template:
 
 ```bash
-mkdir -p /opt/sosove-dashboard
-cd /opt/sosove-dashboard
-curl -O https://raw.githubusercontent.com/sosoveooo-bit/sosove-shopline-dashboard/main/docker-compose.yml
+mkdir -p /opt/sosove-dashboard-docker
+cd /opt/sosove-dashboard-docker
+curl -fsSL https://raw.githubusercontent.com/sosoveooo-bit/sosove-shopline-dashboard/main/docker-compose.yml -o docker-compose.yml
+curl -fsSL https://raw.githubusercontent.com/sosoveooo-bit/sosove-shopline-dashboard/main/.env.example -o .env.example
+test -f .env || cp .env.example .env
+install -d -m 0750 -o root -g 10001 secrets
+chmod 600 .env
 nano .env
+```
+
+Fill `SHOPLINE_ACCESS_TOKEN` and a random `DASHBOARD_ACCESS_TOKEN`. GA4 is optional: when enabled, upload `secrets/ga.json`, set `GA4_SERVICE_ACCOUNT_FILE=/app/secrets/ga.json`, and follow the group/permissions instructions in the guide. Then:
+
+```bash
+docker compose config --quiet
 docker compose pull
 docker compose up -d
+curl -fsS http://127.0.0.1:8000/api/health
 ```
 
-The commands above work without `docker login` after the GHCR package is public.
-Open the package page, go to **Package settings -> Danger Zone -> Change visibility**, and set it to **Public**:
+The container runs as UID/GID `10001`, with read-only code and credentials and a writable named volume for snapshots. `docker compose down` preserves that volume; `down -v` deletes it. Docker restarts exited containers, but an `unhealthy` status alone does not trigger a restart.
 
-```text
-https://github.com/users/sosoveooo-bit/packages/container/package/sosove-shopline-dashboard
-```
-
-If the package stays private, use `docker login ghcr.io -u sosoveooo-bit` and enter a GitHub personal access token with `read:packages` as the password.
-
-Example `.env`:
-
-```bash
-SHOPLINE_API_BASE_URL=https://jp-sosove.myshopline.com
-SHOPLINE_ACCESS_TOKEN=your-shopline-api-token
-SHOPLINE_ORDERS_ENDPOINT=/orders
-SHOPLINE_PRODUCTS_ENDPOINT=/products
-SHOPLINE_API_VERSION=v20260301
-SHOPLINE_STORE_DOMAIN=jp-sosove.myshopline.com
-SHOPLINE_DEFAULT_CURRENCY=JPY
-SHOPLINE_TIMEZONE=Asia/Shanghai
-SHOPLINE_MAX_ORDER_PAGES=10
-SHOPLINE_MAX_PRODUCT_PAGES=25
-SHOPLINE_CONVERSION_TRAFFIC_FIELD=visitors
-SHOPLINE_TRAFFIC_JSON={}
-GA4_PROPERTY_ID=123456789
-GA4_KEY_EVENT_NAME=purchase
-GA4_CONVERSION_METRIC=userKeyEventRate
-GA4_CONVERSION_MODE=key_event_rate
-GA4_SERVICE_ACCOUNT_FILE=C:\path\to\ga4-service-account.json
-SHOPLINE_PRODUCT_COST_RATE=0.35
-SHOPLINE_PAYMENT_FEE_RATE=0.036
-SHOPLINE_SHIPPING_COST_PER_ORDER=500
-SHOPLINE_AD_SPEND_JSON={"Facebook":0,"Instagram":0,"Google":0,"TikTok":0,"Email":0,"Direct":0,"Organic":0,"Ad":0}
-```
-
-The container listens on port `8000`, so open `http://your-server-ip:8000/` or put Nginx in front of it.
-
-Build locally if needed:
-
-```bash
-docker build -t sosove-shopline-dashboard .
-docker run --rm -p 8000:8000 --env-file .env sosove-shopline-dashboard
-```
+Public GHCR images support anonymous pulls. For `unauthorized`, see the guide's source-build fallback using `compose.build.yml`. The default published image supports `linux/amd64`; ARM hosts can build from source. Use a full commit SHA as `DASHBOARD_IMAGE_TAG` to pin or roll back to a successfully published revision.

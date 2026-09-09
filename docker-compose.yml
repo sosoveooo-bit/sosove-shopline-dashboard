@@ -1,8 +1,35 @@
 services:
   dashboard:
-    image: ghcr.io/sosoveooo-bit/sosove-shopline-dashboard:latest
+    image: ghcr.io/sosoveooo-bit/sosove-shopline-dashboard:${DASHBOARD_IMAGE_TAG:-latest}
     ports:
-      - "8000:8000"
+      - "${DASHBOARD_BIND_IP:-127.0.0.1}:${DASHBOARD_PORT:-8000}:8000"
     env_file:
       - .env
+    environment:
+      DASHBOARD_ACCESS_TOKEN: "${DASHBOARD_ACCESS_TOKEN:?Set DASHBOARD_ACCESS_TOKEN in .env before deployment}"
+      DASHBOARD_SNAPSHOT_DIR: /app/runtime/snapshots
+    volumes:
+      - dashboard-runtime:/app/runtime
+      - type: bind
+        source: ./secrets
+        target: /app/secrets
+        read_only: true
+        bind:
+          create_host_path: false
+    init: true
     restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  dashboard-runtime:
