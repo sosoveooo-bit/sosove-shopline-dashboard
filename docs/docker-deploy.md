@@ -1,10 +1,10 @@
-# Docker 部署教程（Ubuntu VPS）
+# Docker 部署教程（Ubuntu / Debian / ARM64 NAS）
 
 项目仓库：[sosove-shopline-dashboard](https://github.com/sosoveooo-bit/sosove-shopline-dashboard)
 
 镜像：`ghcr.io/sosoveooo-bit/sosove-shopline-dashboard:latest`
 
-适用：Ubuntu 22.04/24.04、x86_64/amd64 VPS，Docker Compose v2。镜像中已安装 Python、GA4 依赖和网页代码，VPS 不需要再安装 Python。ARM 服务器请使用第 8 节的源码构建方式。
+适用：Debian 12/13、Ubuntu 22.04/24.04/26.04，使用 `docker compose` 插件。已安装的 Compose v2/v5 通过命令可用性检查后直接复用。容器中已安装 Python、GA4 依赖和网页代码；一键向导会使用宿主机 python3 配置 `.env`。ARM64 服务器使用源码原生构建，GHCR 预构建镜像目前仍为 amd64。
 
 **镜像不包含你的 Shopline Token、GA4 私钥或订单。配置需要在 VPS 上单独提供。**
 
@@ -14,13 +14,13 @@
 
 ## 最简单：一条命令安装
 
-在 Ubuntu VPS 的 **root SSH 终端**执行下面一行。该命令下载并以 root 权限运行本仓库的[安装脚本](../deploy/install_docker.sh)，会安装缺少的 Docker/Compose、git、python3 辅助工具，并构建运行容器。可以先打开脚本查看内容。
+在受支持的 Debian / Ubuntu 的 **root SSH 终端**执行下面一行。该命令下载并以 root 权限运行本仓库的[安装脚本](../deploy/install_docker.sh)，会安装缺少的 Docker/Compose、git、python3 辅助工具，并构建运行容器。可以先打开脚本查看内容。
 
 ```bash
 (sosove_installer=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/sosoveooo-bit/sosove-shopline-dashboard/main/deploy/install_docker.sh -o "$sosove_installer" && bash "$sosove_installer")
 ```
 
-要求：Ubuntu 22.04/24.04/26.04，已有 curl，能访问 GitHub、Docker 官方源、Docker Hub 和 Python 包源。已经有正常 Docker 环境时直接复用；检测到不兼容的既有 Docker/containerd 时会停止提示，不自动卸载其他服务。
+要求：Debian 12/13 或 Ubuntu 22.04/24.04/26.04，已有 curl，能访问 GitHub、Docker 官方源、Docker Hub 和 Python 包源。已经有正常 Docker 环境时直接复用；检测到不兼容的既有 Docker/containerd 时会停止提示，不自动卸载其他服务。
 
 按提示输入：
 
@@ -37,6 +37,27 @@
 GA4 不是安装必填项；已有 `.env` 中的 GA4 设置会保留，新安装先启用 Shopline。补充 GA4 时按第 4 节操作，**把示例中的部署目录改成 `/opt/sosove-dashboard-docker-source`**。一键脚本不会把 Windows 私钥自动上传到 VPS。
 
 不使用一键脚本时，再按下面分步教程操作，两种方式选一种即可。
+
+### Debian 12 ARM64 NAS（Docker 已安装）
+
+如果 `docker version` 显示 `linux/arm64`，`docker info --format '{{.DockerRootDir}}'` 显示 `/vol1/docker`，且 `/vol1` 是有足够空间的数据盘，在 NAS 的 root SSH 终端执行：
+
+```bash
+(sosove_installer=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/sosoveooo-bit/sosove-shopline-dashboard/main/deploy/install_docker.sh -o "$sosove_installer" && SOSOVE_INSTALL_DIR=/vol1/sosove-dashboard-docker SOSOVE_REUSE_DOCKER=1 bash "$sosove_installer")
+```
+
+- 项目目录：`/vol1/sosove-dashboard-docker`，不放到较小的系统分区。
+- 镜像和快照卷仍由现有 Docker 管理，保留 `/vol1/docker`，无需迁移存储或重启 Docker。
+- `SOSOVE_REUSE_DOCKER=1` 禁止安装、更改或启动 Docker 服务；Docker 不可用时停止提示，通过 NAS 容器管理界面处理。
+- 如缺少 git/python3/curl，脚本只安装这些下载和配置工具，不升级系统或替换 Docker。
+- 自动从 Docker 服务端识别 `arm64/aarch64` 并构建 `linux/arm64`，不会拉取本仓库的 amd64-only GHCR 镜像。
+- 安装器保守预留项目盘 256 MiB、Docker 盘 2 GiB 构建空间；不足时停止，不自动清理数据。这是安装器的余量检查，不是固定镜像大小。
+
+要从局域网打开，绑定地址填 `0.0.0.0`，默认端口 `8000`；用 **NAS 的局域网 IP** 访问 `http://NAS_IP:8000/`。系统信息中显示的公网地址可能是出口/代理地址，不能据此保证可以直连 NAS；公网访问需另行配置端口映射、内网穿透或 HTTPS 反向代理。不要暴露 NAS 管理端口。
+
+GA4 文件放 `/vol1/sosove-dashboard-docker/secrets/ga.json`，`.env` 中仍填写容器路径 `/app/secrets/ga.json`。第 4 节的组权限设置和后续 Compose 命令均在这个项目目录执行。
+
+全新 Debian 主机的 Docker 安装分支使用 [Docker Debian 官方源](https://docs.docker.com/engine/install/debian/)；下面第 1 节的手动安装命令只适用于 Ubuntu。NAS 上已有 Docker 时，不要重新运行系统级 Docker 安装命令。
 
 ## 1. 确认 Docker 已安装
 

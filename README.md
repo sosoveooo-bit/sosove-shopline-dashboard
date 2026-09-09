@@ -6,13 +6,21 @@ A small full-stack dashboard for monitoring Shopline store data.
 
 ### 一条命令安装
 
-在 Ubuntu 22.04/24.04/26.04 的 **root SSH 终端**执行（需要能访问 GitHub 和已安装 curl）：
+在 Debian 12/13 或 Ubuntu 22.04/24.04/26.04 的 **root SSH 终端**执行（需要能访问 GitHub 和已安装 curl）：
 
 ```bash
 (sosove_installer=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/sosoveooo-bit/sosove-shopline-dashboard/main/deploy/install_docker.sh -o "$sosove_installer" && bash "$sosove_installer")
 ```
 
 命令会以 root 权限运行本仓库的[安装脚本](deploy/install_docker.sh)，自动安装缺少的 Docker 组件、下载源码、询问配置并构建启动。Shopline Token 和面板密码由你输入；公网 IP 访问时按提示填写 `0.0.0.0` 并在云安全组放行所选端口，默认 `8000`。默认安装目录为 `/opt/sosove-dashboard-docker-source`。已有配置会保留，旧 Nginx/systemd 面板不会被停止；GA4 私钥可以稍后按教程配置。
+
+Debian 12 ARM64 NAS，且 Docker 已安装、数据盘挂载在 `/vol1` 时，使用下面这一条，把项目也放到数据盘：
+
+```bash
+(sosove_installer=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/sosoveooo-bit/sosove-shopline-dashboard/main/deploy/install_docker.sh -o "$sosove_installer" && SOSOVE_INSTALL_DIR=/vol1/sosove-dashboard-docker SOSOVE_REUSE_DOCKER=1 bash "$sosove_installer")
+```
+
+NAS 模式不安装、升级、重启或更改 Docker，只使用现有的 `docker compose`。镜像按 Docker 服务端架构原生构建，不需要 GHCR 密码。若缺少 git/python3/curl，仅安装这些下载/配置辅助工具。构建前检查项目和 Docker 存储盘的可用空间，不自动删除镜像或其他数据。
 
 完整中文教程：[Ubuntu VPS Docker 部署](docs/docker-deploy.md)
 

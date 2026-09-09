@@ -6,11 +6,23 @@ INSTALL_DIR="${SOSOVE_INSTALL_DIR:-/opt/sosove-dashboard-docker-source}"
 
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
+select_distribution() {
+    case "${ID:-}:${VERSION_ID:-}" in
+        ubuntu:22.04|ubuntu:24.04|ubuntu:26.04) DOCKER_DISTRO=ubuntu ;;
+        debian:12|debian:13) DOCKER_DISTRO=debian ;;
+        *) fail 'Supported systems: Debian 12/13 and Ubuntu 22.04/24.04/26.04.' ;;
+    esac
+    [[ "${VERSION_CODENAME:-}" =~ ^[a-z]+$ ]] || fail 'Missing or invalid distribution codename.'
+}
+
 validate_directory() {
     [[ "$INSTALL_DIR" == /* && "$INSTALL_DIR" != *$'\n'* ]] || fail 'Installation path must be absolute.'
     [[ ! -L "$INSTALL_DIR" ]] || fail 'Installation directory cannot be a symbolic link.'
     INSTALL_DIR="$(realpath -m -- "$INSTALL_DIR")"
-    case "$INSTALL_DIR" in /|/opt|/srv|/root|/tmp|/home|/usr|/var|/etc) fail 'Refusing a broad system directory.' ;; esac
+    case "$INSTALL_DIR" in /|/opt|/srv|/root|/tmp|/home|/usr|/var|/etc|/vol[0-9]*|/fs)
+        # A directory inside a volume is fine; never use the volume root itself.
+        [[ "$INSTALL_DIR" =~ ^/vol[0-9]+/.+ ]] || fail 'Refusing a broad system directory.' ;;
+    esac
 }
 
 install_prerequisites() {
@@ -21,6 +33,13 @@ install_prerequisites() {
 }
 
 ensure_docker() {
+    if [[ "${SOSOVE_REUSE_DOCKER:-0}" == 1 ]]; then
+        command -v docker >/dev/null || fail 'NAS mode requires Docker already installed; use the NAS container manager.'
+        docker compose version >/dev/null || fail 'NAS Docker Compose is unavailable; no packages were changed.'
+        docker info >/dev/null 2>&1 || fail 'NAS Docker daemon is unavailable; start it from the NAS container manager.'
+        printf 'Reusing existing NAS Docker; daemon configuration and other containers are unchanged.\n'
+        return
+    fi
     if ! command -v docker >/dev/null; then
         local package
         for package in docker.io docker-compose docker-compose-v2 podman-docker containerd runc; do
@@ -32,22 +51,54 @@ ensure_docker() {
         apt-get install -y ca-certificates curl
         install -d -m 0755 /etc/apt/keyrings
         if [[ ! -f /etc/apt/keyrings/docker.asc ]]; then
-            curl -fsSL --retry 3 https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+            curl -fsSL --retry 3 "https://download.docker.com/linux/$DOCKER_DISTRO/gpg" -o /etc/apt/keyrings/docker.asc
             chmod a+r /etc/apt/keyrings/docker.asc
         fi
         if [[ ! -f /etc/apt/sources.list.d/docker.sources ]]; then
-            printf 'Types: deb\nURIs: https://download.docker.com/linux/ubuntu\nSuites: %s\nComponents: stable\nArchitectures: %s\nSigned-By: /etc/apt/keyrings/docker.asc\n' \
-                "$VERSION_CODENAME" "$(dpkg --print-architecture)" > /etc/apt/sources.list.d/docker.sources
+            printf 'Types: deb\nURIs: https://download.docker.com/linux/%s\nSuites: %s\nComponents: stable\nArchitectures: %s\nSigned-By: /etc/apt/keyrings/docker.asc\n' \
+                "$DOCKER_DISTRO" "$VERSION_CODENAME" "$(dpkg --print-architecture)" > /etc/apt/sources.list.d/docker.sources
         fi
         apt-get update
         apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
         systemctl enable --now docker
     fi
-    docker compose version >/dev/null || fail 'Docker exists but Compose v2 is missing. See docs/docker-deploy.md.'
+    docker compose version >/dev/null || fail 'Docker Compose plugin is missing. See docs/docker-deploy.md.'
     if ! docker info >/dev/null 2>&1; then
         systemctl start docker
     fi
     docker info >/dev/null 2>&1 || fail 'Docker daemon is not available.'
+}
+
+select_build_platform() {
+    local architecture
+    architecture="$(docker info --format '{{.Architecture}}')"
+    case "$architecture" in
+        aarch64|arm64) export DOCKER_DEFAULT_PLATFORM=linux/arm64 ;;
+        x86_64|amd64) export DOCKER_DEFAULT_PLATFORM=linux/amd64 ;;
+        *) fail "Unsupported Docker server architecture: $architecture" ;;
+    esac
+    printf 'Native image build: %s\n' "$DOCKER_DEFAULT_PLATFORM"
+}
+
+check_storage() {
+    local docker_root
+    docker_root="$(docker info --format '{{.DockerRootDir}}')"
+    python3 - "$INSTALL_DIR" "$docker_root" <<'PY'
+import shutil, sys
+from pathlib import Path
+app = Path(sys.argv[1]).resolve()
+docker_root = Path(sys.argv[2]).resolve()
+if app == docker_root or docker_root in app.parents or app in docker_root.parents:
+    sys.exit('Choose an application folder separate from the Docker-managed storage directory.')
+for label, requested, reserve in [('Project', app, 256 * 1024**2), ('Docker', docker_root, 2 * 1024**3)]:
+    path = requested
+    while not path.exists() and path != path.parent:
+        path = path.parent
+    free = shutil.disk_usage(path).free
+    print(f'{label}: {requested}; available {free / 1024**3:.1f} GiB')
+    if free < reserve:
+        sys.exit(f'{label} volume needs at least {reserve / 1024**3:.2f} GiB of free headroom before building. No data was deleted.')
+PY
 }
 
 sync_repository() {
@@ -68,14 +119,21 @@ sync_repository() {
 
 main() {
     [[ "${EUID}" -eq 0 ]] || fail 'Run this installer as root (sudo bash install_docker.sh).'
-    [[ -r /etc/os-release ]] || fail 'Ubuntu 22.04/24.04/26.04 is required.'
+    [[ -r /etc/os-release ]] || fail 'Debian or Ubuntu /etc/os-release is required.'
     # Only source the trusted OS release file, never the dashboard .env.
     . /etc/os-release
-    [[ "$ID" == ubuntu && "$VERSION_ID" =~ ^(22\.04|24\.04|26\.04)$ ]] || fail 'This installer supports Ubuntu 22.04/24.04/26.04.'
+    select_distribution
     validate_directory
     printf 'Installing SOSOVE Docker dashboard in %s. Existing websites will not be stopped.\n' "$INSTALL_DIR"
-    install_prerequisites
-    ensure_docker
+    if [[ "${SOSOVE_REUSE_DOCKER:-0}" == 1 ]]; then
+        ensure_docker
+        install_prerequisites
+    else
+        install_prerequisites
+        ensure_docker
+    fi
+    select_build_platform
+    check_storage
     sync_repository
     cd "$INSTALL_DIR"
     [[ ! -L secrets ]] || fail 'Refusing a symbolic-link secrets directory.'

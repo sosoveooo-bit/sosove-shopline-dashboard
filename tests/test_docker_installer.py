@@ -109,6 +109,53 @@ class DockerInstallerShellTests(unittest.TestCase):
         result = subprocess.run([self.bash, "-n", "deploy/install_docker.sh"], cwd=ROOT, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def shell(self, script):
+        return subprocess.run([self.bash, "-c", "source deploy/install_docker.sh; " + script], cwd=ROOT, capture_output=True, text=True)
+
+    def test_debian_bookworm_and_ubuntu_use_their_own_docker_repository(self):
+        for system, version, codename in (("debian", "12", "bookworm"), ("debian", "13", "trixie"), ("ubuntu", "24.04", "noble")):
+            with self.subTest(system=system, version=version):
+                result = self.shell(f"ID={system}; VERSION_ID={version}; VERSION_CODENAME={codename}; select_distribution; printf '%s' \"$DOCKER_DISTRO\"")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, system)
+
+    def test_ready_nas_docker_never_calls_package_manager_or_service_manager(self):
+        result = self.shell('''
+SOSOVE_REUSE_DOCKER=1
+docker() { case "$*" in 'compose version'|info) return 0;; *) return 99;; esac; }
+apt-get() { echo 'unexpected package installation' >&2; return 99; }
+systemctl() { echo 'unexpected service restart' >&2; return 99; }
+ensure_docker
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("unexpected", result.stderr)
+
+    def test_nas_mode_fails_without_restarting_an_unavailable_daemon(self):
+        result = self.shell('''
+SOSOVE_REUSE_DOCKER=1
+docker() { [[ "$*" == 'compose version' ]]; }
+systemctl() { echo 'unexpected service restart' >&2; return 99; }
+ensure_docker
+''')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("unexpected", result.stderr)
+        self.assertIn("NAS", result.stderr)
+
+    def test_native_build_platform_is_derived_from_docker_server(self):
+        for architecture, expected in (("aarch64", "linux/arm64"), ("arm64", "linux/arm64"), ("x86_64", "linux/amd64")):
+            with self.subTest(architecture=architecture):
+                result = self.shell(f"docker() {{ printf '{architecture}'; }}; select_build_platform; printf '%s' \"$DOCKER_DEFAULT_PLATFORM\"")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(result.stdout.endswith(expected))
+
+    def test_other_operating_systems_still_fail_closed(self):
+        result = self.shell('ID=fedora; VERSION_ID=40; VERSION_CODENAME=unknown; select_distribution')
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_nas_data_volume_root_is_rejected(self):
+        result = self.shell('INSTALL_DIR=/vol1; validate_directory')
+        self.assertNotEqual(result.returncode, 0)
+
     def test_broad_directory_is_rejected_without_mutation(self):
         result = subprocess.run([self.bash, "-c", "source deploy/install_docker.sh; INSTALL_DIR=/opt; validate_directory"], cwd=ROOT, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)

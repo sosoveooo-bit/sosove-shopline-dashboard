@@ -11,7 +11,43 @@ permissions:
   packages: write
 
 jobs:
+  arm64-check:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Check installer guards on ARM64
+        run: |
+          python -m pip install pytest
+          python -m pytest tests/test_docker_installer.py -q
+          docker run --rm --mount "type=bind,source=$PWD,target=/src,readonly" debian:12-slim bash -c 'source /src/deploy/install_docker.sh; source /etc/os-release; select_distribution; test "$DOCKER_DISTRO" = debian; test "$VERSION_CODENAME" = bookworm'
+
+      - name: Install with existing Docker on ARM64
+        run: |
+          app_dir="/tmp/sosove-arm64-ci-${GITHUB_RUN_ID}"
+          sudo env SOSOVE_INSTALL_DIR="$app_dir" SOSOVE_REUSE_DOCKER=1 SOSOVE_INSTALL_NONINTERACTIVE=1 COMPOSE_PROJECT_NAME=sosove-arm64-install SHOPLINE_API_BASE_URL=https://example.myshopline.com SHOPLINE_ACCESS_TOKEN=ci-only-shopline-token DASHBOARD_ACCESS_TOKEN=ci-installer-password DASHBOARD_PORT=18001 DASHBOARD_BIND_IP=127.0.0.1 bash deploy/install_docker.sh
+          test "$(docker image inspect sosove-shopline-dashboard:local --format '{{.Architecture}}')" = arm64
+          curl -fsS http://127.0.0.1:18001/api/health
+          sudo env COMPOSE_PROJECT_NAME=sosove-arm64-install docker compose --project-directory "$app_dir" -f "$app_dir/docker-compose.yml" -f "$app_dir/compose.build.yml" down
+
+      - name: Check ARM64 background snapshots with synthetic data
+        run: |
+          docker run -d --name sosove-arm64-smoke -p 127.0.0.1:18000:8000 --read-only --tmpfs /tmp --mount type=volume,source=sosove-arm64-ci-cache,target=/app/runtime -e DASHBOARD_ACCESS_TOKEN=ci-smoke-token sosove-shopline-dashboard:local
+          python deploy/smoke_container.py
+          docker exec sosove-arm64-smoke python -c 'from google.analytics.data_v1beta import BetaAnalyticsDataClient; import os; assert os.getuid() == 10001; print("ARM64 GA4 dependency import passed")'
+          docker rm -f sosove-arm64-smoke
+
   build-and-push:
+    needs: arm64-check
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
