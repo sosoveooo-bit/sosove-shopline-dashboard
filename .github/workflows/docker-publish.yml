@@ -46,6 +46,9 @@ jobs:
           docker exec sosove-arm64-smoke python -c 'from google.analytics.data_v1beta import BetaAnalyticsDataClient; import os; assert os.getuid() == 10001; print("ARM64 GA4 dependency import passed")'
           docker rm -f sosove-arm64-smoke
 
+      - name: Check NAS restrictive source permissions on ARM64
+        run: bash deploy/test_image_permissions.sh
+
   build-and-push:
     needs: arm64-check
     runs-on: ubuntu-latest
@@ -117,6 +120,9 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check restrictive source permissions on AMD64
+        run: bash deploy/test_image_permissions.sh
 
       - name: Build and push
         uses: docker/build-push-action@v6

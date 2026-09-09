@@ -21,6 +21,13 @@ RUN pip install --no-cache-dir -r requirements.txt \
 COPY app.py .
 COPY shopline_monitor/ shopline_monitor/
 
+# COPY preserves NAS checkout modes (for example files 0600, directories 0700).
+# Normalize public application code only; credentials and runtime data are not here.
+RUN chmod 0755 /app \
+    && chmod 0644 /app/app.py \
+    && find /app/shopline_monitor -type d -exec chmod 0755 {} + \
+    && find /app/shopline_monitor -type f -exec chmod 0644 {} +
+
 USER 10001:10001
 
 EXPOSE 8000

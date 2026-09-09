@@ -274,9 +274,21 @@ docker compose ps
 | GA4 `Permission denied` | 按第 4 节设置目录和文件的组为 `10001`，目录 `750`、文件 `640`。 |
 | GA4 属性 `403` | 服务账号未获得该数字 Property ID 的权限，去 GA4 属性访问管理添加相应账号。 |
 | `port is already allocated` | 检查占用者；改 `DASHBOARD_PORT=8001` 后重新 `up -d`，不要直接杀掉别的服务。 |
+| `PermissionError: /app/app.py`，容器不断重启 | 旧 Dockerfile 没有统一 NAS 源码权限。新版在镜像内统一程序目录 `755`、程序文件 `644`。执行下面的更新修复命令，不要将整个目录设为 `777`，也不要改用 root 运行容器。 |
 | 本机健康检查正常，公网打不开 | 检查是否仍绑定 `127.0.0.1`、云安全组和访问端口。使用 SSH 隧道时浏览器访问本机 `18000`。 |
 | 没有真实订单 / 出现演示数据 | 填写有效的 Shopline API 地址和 Token，重新创建容器，再查看面板“接口测试”。 |
 | `no matching manifest`（ARM VPS） | 当前预构建镜像为 amd64；ARM 使用下面的源码构建。 |
+
+NAS 源码安装遇到 `/app/app.py` 权限错误时，在原部署目录更新并重建：
+
+```bash
+cd /vol1/sosove-dashboard-docker
+git pull --ff-only
+docker compose -f docker-compose.yml -f compose.build.yml build
+docker compose -f docker-compose.yml -f compose.build.yml up -d --pull never --force-recreate
+```
+
+这些命令保留 `.env`、GA4 私钥和快照卷。原端口若是 `8001`，启动后用 `curl -fsS http://127.0.0.1:8001/api/health` 检查。没有更改依赖时无需使用 `--no-cache`，新增权限修复层会自动参与构建。
 
 ## 8. 不用 GHCR 登录：从公开源码构建
 
