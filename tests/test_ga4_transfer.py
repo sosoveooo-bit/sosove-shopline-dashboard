@@ -4,7 +4,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from deploy import ga4_transfer as transfer
 from deploy.configure_docker import parse_values
@@ -77,6 +77,17 @@ class Ga4TransferTests(unittest.TestCase):
             if os.name == "posix":
                 self.assertEqual((project / ".env").stat().st_mode & 0o777, 0o600)
                 self.assertEqual((project / "secrets/ga.json").stat().st_mode & 0o777, 0o640)
+
+    def test_permissions_are_applied_after_nas_chown(self):
+        events = []
+        fake_os = Mock(wraps=os)
+        fake_os.name = "posix"
+        fake_os.chown = lambda _path, uid, gid: events.append(("chown", uid, gid))
+        path = Mock()
+        path.chmod.side_effect = lambda mode: events.append(("chmod", mode))
+        with patch.object(transfer, "os", fake_os):
+            transfer.set_owner_and_mode(path, 0o640)
+        self.assertEqual(events, [("chown", 0, 10001), ("chmod", 0o640)])
 
     def test_config_failure_rolls_back_previous_key_and_env(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(transfer.os, "chown", create=True):

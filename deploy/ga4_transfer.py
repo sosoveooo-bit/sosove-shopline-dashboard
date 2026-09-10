@@ -98,12 +98,17 @@ def atomic_private_write(path: Path, data: bytes, mode: int) -> None:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-        temporary.chmod(mode)
-        if os.name == "posix":
-            os.chown(temporary, 0, 10001)
+        set_owner_and_mode(temporary, mode)
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def set_owner_and_mode(path: Path, mode: int) -> None:
+    if os.name == "posix":
+        os.chown(path, 0, 10001)
+    # Some NAS filesystems clear group permission bits during chown.
+    path.chmod(mode)
 
 
 def install_payload(project: Path, payload: dict) -> None:
@@ -119,9 +124,7 @@ def install_payload(project: Path, payload: dict) -> None:
     before_env = env_path.read_bytes()
     before_secret = secret_path.read_bytes() if secret_path.exists() else None
     secret_dir.mkdir(mode=0o750, exist_ok=True)
-    secret_dir.chmod(0o750)
-    if os.name == "posix":
-        os.chown(secret_dir, 0, 10001)
+    set_owner_and_mode(secret_dir, 0o750)
     if before_secret is not None:
         backup = secret_dir / ("ga.json.backup-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f"))
         atomic_private_write(backup, before_secret, 0o600)
